@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "Ticket": {
+      "title": "Ticket",
+      "description": "A support ticket from Splendid Technology",
+      "type": "object",
+      "properties": {
+        "ticketNumber": {
+          "type": "string",
+          "description": "The unique ticket number provided by the vendor"
+        },
+        "subject": {
+          "type": "string",
+          "description": "The subject line of the support email"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Done", "In Progress", "Visit Scheduled", "Open"],
+          "description": "The current lifecycle stage of the ticket"
+        },
+        "visitDate": {
+          "type": "string",
+          "format": "date",
+          "description": "The scheduled date for a campus visit"
+        },
+        "contactName": {
+          "type": "string",
+          "description": "Name of the site contact extracted from email"
+        },
+        "address": {
+          "type": "string",
+          "description": "Campus address extracted from email"
+        },
+        "userId": {
+          "type": "string",
+          "description": "The UID of the user who created/manages this record"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ticketNumber", "subject", "status", "userId", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/tickets/{ticketId}": {
+      "schema": "Ticket",
+      "description": "Collection of vendor support tickets"
+    }
+  }
+}

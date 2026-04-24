@@ -1,0 +1,51 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-dash-bg: #F2F0E8; /* warm light gray */
+  --color-dash-card: #ffffff;
+  --color-dash-border: #D1CEC2; /* muted beige/gray */
+  --color-dash-text: #2C2826; /* charcoal brown */
+  --color-dash-muted: #7A746E;
+  
+  --color-dash-accent: #4A0E22; /* STS Maroon */
+  --color-dash-secondary: #3E4A1E; /* STS Moss Green */
+  --color-dash-blue: #5D82C4; /* STS Slate Blue */
+  --color-dash-gold: #A68B4C; /* STS Gold */
+  
+  --color-status-done: #3E4A1E; /* Moss Green for Done */
+  --color-status-progress: #A68B4C; /* Gold for Progress */
+  --color-status-visit: #4A0E22; /* Maroon for Alerts/Visits */
+  --color-status-open: #8E9299;
+}
+
+@layer base {
+  body {
+    @apply bg-dash-bg text-dash-text font-sans antialiased;
+    background-image: radial-gradient(circle at 50% 50%, rgba(74, 14, 34, 0.03) 0%, transparent 100%);
+  }
+}
+
+.app-frame {
+  @apply fixed inset-0 pointer-events-none z-[100];
+  border: 12px solid var(--color-dash-accent);
+}
+
+.app-frame::after {
+  content: '';
+  @apply absolute inset-0;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  margin: -6px;
+}
+
+@keyframes alert-blink {
+  0%, 100% { background-color: rgba(74, 14, 34, 0.1); border-color: #4A0E22; }
+  50% { background-color: transparent; border-color: rgba(74, 14, 34, 0.2); }
+}
+
+.alert-active {
+  animation: alert-blink 1.5s infinite ease-in-out;
+}

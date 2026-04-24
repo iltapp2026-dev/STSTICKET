@@ -1,0 +1,6 @@
+{
+  "name": "STS Ticket Tracker",
+  "description": "A dark-themed dashboard for tracking vendor support tickets with automatic status detection and visit alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

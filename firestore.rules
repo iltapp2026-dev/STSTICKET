@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidTicket(data) {
+      return data.ticketNumber is string && data.ticketNumber.size() > 0 && data.ticketNumber.size() <= 100 &&
+             data.subject is string && data.subject.size() > 0 && data.subject.size() <= 500 &&
+             data.status in ['Done', 'In Progress', 'Visit Scheduled', 'Open'] &&
+             data.userId is string &&
+             (data.visitDate == null || (data.visitDate is string && data.visitDate.size() <= 50));
+    }
+
+    match /tickets/{ticketId} {
+      allow read: if true;
+      
+      allow create: if isSignedIn() && 
+                    isValidId(ticketId) && 
+                    isValidTicket(incoming()) && 
+                    incoming().createdAt == request.time && 
+                    incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() && 
+                    isValidTicket(incoming()) && 
+                    incoming().createdAt == existing().createdAt && 
+                    incoming().updatedAt == request.time;
+
+      allow delete: if isSignedIn();
+    }
+  }
+}
