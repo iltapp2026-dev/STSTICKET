@@ -65,23 +65,36 @@ function cn(...inputs: ClassValue[]) {
 
 function StatusBadge({ status }: { status: string }) {
   const s = status.toLowerCase();
-  const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed');
-  const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit');
+  const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
+  const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
   
-  let dotColor = 'bg-red-500 shadow-red-500/50';
-  let bgColor = 'bg-red-500/10 text-red-500 border-red-500/20';
+  let bgColor = 'bg-red-500';
+  let textColor = 'text-white';
+  let borderColor = 'border-red-400';
+  let animateClass = 'animate-[pulse_1.5s_infinite] ring-4 ring-red-500/40';
   
   if (isResolved) {
-    dotColor = 'bg-green-500 shadow-green-500/50';
-    bgColor = 'bg-green-500/10 text-green-500 border-green-500/20';
+    bgColor = 'bg-emerald-500';
+    borderColor = 'border-emerald-400';
+    animateClass = ''; 
   } else if (isInProgress) {
-    dotColor = 'bg-orange-500 shadow-orange-500/50';
-    bgColor = 'bg-orange-500/10 text-orange-500 border-orange-500/20';
+    bgColor = 'bg-amber-400';
+    textColor = 'text-amber-950';
+    borderColor = 'border-amber-300';
+    animateClass = 'ring-2 ring-amber-400/30'; // subtle ring, no pulse
   }
 
   return (
-    <div className={cn("flex items-center gap-2 px-3 py-1 rounded-full border text-[9px] font-black uppercase tracking-widest w-fit", bgColor)}>
-      <div className={cn("w-2 h-2 rounded-full animate-pulse shadow-[0_0_10px_rgba(34,197,94,0.7)]", dotColor)} />
+    <div 
+      className={cn(
+        "flex items-center gap-2 px-4 py-2 rounded-full border text-[10px] font-black uppercase tracking-[0.15em] w-fit min-w-[120px] justify-center transition-all shadow-lg",
+        bgColor,
+        textColor,
+        borderColor,
+        animateClass
+      )}
+    >
+      <div className="w-1.5 h-1.5 rounded-full bg-white/90 shadow-[0_0_8px_rgba(255,255,255,0.8)]" />
       {status}
     </div>
   );
@@ -172,19 +185,59 @@ export default function App() {
     return tickets.filter(t => {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
-      const matchesStatus = statusFilter === 'All' || t.status === statusFilter;
+      
+      const s = t.status.toLowerCase();
+      const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
+      const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
+      const isOpen = !isResolved && !isInProgress;
+
+      let matchesStatus = statusFilter === 'All';
+      if (statusFilter === 'Resolved') matchesStatus = isResolved;
+      if (statusFilter === 'In Progress') matchesStatus = isInProgress;
+      if (statusFilter === 'Open') matchesStatus = isOpen;
+      if (statusFilter !== 'All' && statusFilter !== 'Resolved' && statusFilter !== 'In Progress' && statusFilter !== 'Open') {
+        matchesStatus = t.status === statusFilter;
+      }
+
       const notArchived = !t.archived;
       return matchesSearch && matchesStatus && notArchived;
     });
   }, [tickets, search, statusFilter]);
 
-  const stats = useMemo(() => ({
-    total: tickets.length,
-    open: tickets.filter(t => t.status === 'Open').length,
-    progress: tickets.filter(t => t.status === 'In Progress').length,
-    done: tickets.filter(t => t.status === 'Done').length,
-    visits: tickets.filter(t => t.status === 'Visit Scheduled').length,
-  }), [tickets]);
+  useEffect(() => {
+    // Background auto-corrector for statuses based on intelligence
+    if (tickets.length > 0) {
+      tickets.forEach(ticket => {
+        if (ticket.status === 'Done' || ticket.archived) return;
+        
+        // Use full content if available, otherwise fallback to brief
+        const intelligentStatus = getStatusFromSubject(ticket.subject, undefined, ticket.content || ticket.brief);
+        if (intelligentStatus === 'Done' && ticket.status !== 'Done') {
+          console.log(`Auto-correcting ticket #${ticket.ticketNumber} to Done based on content`);
+          updateDoc(doc(db, 'tickets', ticket.id), {
+            status: 'Done',
+            updatedAt: serverTimestamp()
+          }).catch(err => console.error("Auto-correct failed:", err));
+        }
+      });
+    }
+  }, [tickets]); // Run when tickets update
+
+  const stats = useMemo(() => {
+    const counts = { total: 0, open: 0, progress: 0, done: 0 };
+    tickets.forEach(t => {
+      if (t.archived) return;
+      counts.total++;
+      const s = t.status.toLowerCase();
+      const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
+      const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
+      
+      if (isResolved) counts.done++;
+      else if (isInProgress) counts.progress++;
+      else counts.open++;
+    });
+    return counts;
+  }, [tickets]);
 
   const upcomingVisits = useMemo(() => {
     const today = startOfDay(new Date());
@@ -209,7 +262,7 @@ export default function App() {
     const data = {
       ticketNumber,
       subject,
-      status: getStatusFromSubject(subject),
+      status: getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief),
       visitDate: visitDate || null,
       contactName: contactName || null,
       address: address || null,
@@ -377,7 +430,7 @@ export default function App() {
     setImportStatus('Parsing content...');
 
     try {
-      const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief } = parseEmailHTML(manualContent, '');
+      const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent } = parseEmailHTML(manualContent, '');
       
       const ticketNumber = manualTicketNumber.trim() || parsedNumber;
 
@@ -392,11 +445,14 @@ export default function App() {
             setIsImporting(false);
             return;
           }
+          const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
           await addDoc(collection(db, 'tickets'), {
             ticketNumber: normalizedNumber,
             subject: ticketSub,
-            status: status || 'Open',
+            status: finalStatus,
             brief: brief || '',
+            content: content || '',
+            htmlContent: htmlContent || '',
             visitDate: vDate || null,
             contactName: cName || '',
             address: addr || '',
@@ -514,7 +570,7 @@ export default function App() {
         }
 
         if (htmlContent) {
-          const { ticketNumber: rawNum, subject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief } = parseEmailHTML(htmlContent, innerSubject);
+          const { ticketNumber: rawNum, subject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent, innerSubject);
           const ticketNumber = rawNum.trim();
           
           if (ticketNumber && subject) {
@@ -525,12 +581,14 @@ export default function App() {
                 setIsImporting(false);
                 return;
               }
-              const finalStatus = getStatusFromSubject(subject, rawStatus, brief);
+              const finalStatus = getStatusFromSubject(subject, rawStatus, content || brief);
               await addDoc(collection(db, 'tickets'), {
                 ticketNumber,
                 subject,
                 status: finalStatus,
                 brief: brief || '',
+                content: content || '',
+                htmlContent: extractedHtml || '',
                 visitDate: vDate || null,
                 contactName: cName || '',
                 address: addr || '',
@@ -565,6 +623,15 @@ export default function App() {
   };
 
   const openEdit = (ticket: Ticket) => {
+    // Auto-correct status if it has changed due to intelligence updates
+    const currentStatus = getStatusFromSubject(ticket.subject, undefined, ticket.brief);
+    if (currentStatus !== ticket.status && currentStatus === 'Done') {
+      updateDoc(doc(db, 'tickets', ticket.id), { 
+        status: 'Done',
+        updatedAt: serverTimestamp() 
+      }).catch(console.error);
+    }
+
     setEditingTicket(ticket);
     setTicketNumber(ticket.ticketNumber);
     setSubject(ticket.subject);
@@ -1107,22 +1174,46 @@ export default function App() {
                 <div className="flex-1 flex flex-col gap-6">
                   {/* Top Stats */}
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1">Total Managed</div>
+                    <button 
+                      onClick={() => setStatusFilter('All')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        statusFilter === 'All' ? "border-dash-accent ring-1 ring-dash-accent bg-dash-accent/5" : "border-dash-border hover:border-dash-accent"
+                      )}
+                    >
+                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 group-hover:text-dash-text transition-colors">Total Managed</div>
                       <div className="text-2xl font-bold">{stats.total}</div>
-                    </div>
-                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-accent">Critical Open</div>
-                      <div className="text-2xl font-bold text-dash-accent">{stats.open.toString().padStart(2, '0')}</div>
-                    </div>
-                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-gold">In Transit</div>
-                      <div className="text-2xl font-bold text-dash-gold">{stats.progress.toString().padStart(2, '0')}</div>
-                    </div>
-                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-secondary">Resolved</div>
-                      <div className="text-2xl font-bold text-dash-secondary">{stats.done.toString().padStart(2, '0')}</div>
-                    </div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('Open')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        statusFilter === 'Open' ? "border-red-500 ring-2 ring-red-500/20 bg-red-500/10" : "border-dash-border hover:border-red-400"
+                      )}
+                    >
+                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-red-600">Critical Open</div>
+                      <div className="text-2xl font-bold text-red-600">{stats.open.toString().padStart(2, '0')}</div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('In Progress')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        statusFilter === 'In Progress' ? "border-amber-500 ring-2 ring-amber-500/20 bg-amber-500/10" : "border-dash-border hover:border-amber-400"
+                      )}
+                    >
+                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-amber-600">In Transit</div>
+                      <div className="text-2xl font-bold text-amber-600">{stats.progress.toString().padStart(2, '0')}</div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('Resolved')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        statusFilter === 'Resolved' ? "border-green-500 ring-2 ring-green-500/20 bg-green-500/10" : "border-dash-border hover:border-green-400"
+                      )}
+                    >
+                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-green-600">Resolved</div>
+                      <div className="text-2xl font-bold text-green-600">{stats.done.toString().padStart(2, '0')}</div>
+                    </button>
                   </div>
 
                   {/* Header/Controls */}
@@ -1456,18 +1547,35 @@ export default function App() {
               <div className="space-y-6">
                 <div>
                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Live Status</label>
-                   <StatusBadge status={getStatusFromSubject(subject, undefined, editingTicket?.brief)} />
+                   <StatusBadge status={getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief)} />
                 </div>
 
-                {editingTicket?.brief ? (
+                {editingTicket?.brief && (
                   <div className="p-5 rounded-2xl bg-dash-accent/5 border border-dash-accent/10 relative overflow-hidden">
                     <div className="absolute top-0 left-0 w-1 h-full bg-dash-accent" />
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-3">Intelligence Brief</label>
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-3">Intelligence Summary</label>
                     <p className="text-sm leading-relaxed text-dash-text italic font-medium">"{editingTicket.brief}"</p>
                   </div>
-                ) : (
-                  <div className="p-5 rounded-2xl bg-dash-bg border border-dash-border border-dashed relative">
-                    <p className="text-[10px] text-dash-muted uppercase font-bold tracking-widest text-center">No intelligence brief extracted</p>
+                )}
+
+                {editingTicket?.content && !editingTicket?.htmlContent && (
+                  <div className="space-y-2">
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Intelligence Log Content</label>
+                    <div className="w-full bg-dash-bg border border-dash-border rounded-xl p-5 overflow-y-auto max-h-[300px] text-xs leading-relaxed text-dash-muted font-mono whitespace-pre-wrap">
+                      {editingTicket.content}
+                    </div>
+                  </div>
+                )}
+
+                {editingTicket?.htmlContent && (
+                  <div className="space-y-2">
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Original Email Record</label>
+                    <div 
+                      className="w-full bg-white border border-dash-border rounded-xl overflow-hidden overflow-y-auto max-h-[500px]"
+                      style={{ color: 'initial' }}
+                    >
+                      <div className="p-4 transform scale-[0.9] origin-top-left" dangerouslySetInnerHTML={{ __html: editingTicket.htmlContent }} />
+                    </div>
                   </div>
                 )}
 
@@ -1492,19 +1600,46 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Campus Address</label>
-                    <div className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm min-h-[44px]">
-                      {address || 'N/A'}
-                    </div>
+                    <input 
+                      value={address}
+                      onChange={(e) => setAddress(e.target.value)}
+                      placeholder="N/A"
+                      className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm focus:outline-none focus:border-dash-accent transition-all"
+                    />
                   </div>
                   <div>
                     <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Visit Estimate</label>
-                    <div className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm min-h-[44px]">
-                      {visitDate || 'No schedule detected'}
-                    </div>
+                    <input 
+                      value={visitDate}
+                      onChange={(e) => setVisitDate(e.target.value)}
+                      placeholder="No schedule detected"
+                      className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm focus:outline-none focus:border-dash-accent transition-all"
+                    />
                   </div>
                 </div>
 
                 <div className="pt-10 space-y-4">
+                  {editingTicket && (
+                    <button 
+                      type="button"
+                      onClick={async () => {
+                        const data = {
+                          ticketNumber,
+                          subject,
+                          status: getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief),
+                          visitDate: visitDate || null,
+                          address: address || null,
+                          updatedAt: serverTimestamp()
+                        };
+                        await updateDoc(doc(db, 'tickets', editingTicket.id), data);
+                        setIsAddOpen(false);
+                      }}
+                      className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all"
+                    >
+                      Commit Record Changes
+                    </button>
+                  )}
+
                   {editingTicket && (getStatusFromSubject(subject).toLowerCase().includes('done') || getStatusFromSubject(subject).toLowerCase().includes('complete') || getStatusFromSubject(subject).toLowerCase().includes('resolve')) && (
                     <button 
                       type="button"
@@ -1514,10 +1649,10 @@ export default function App() {
                           setIsAddOpen(false);
                         }
                       }}
-                      className="w-full bg-dash-bg border border-dash-border py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:border-dash-accent transition-all flex items-center justify-center gap-2 group"
+                      className="w-full bg-dash-bg border border-dash-border py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:border-dash-secondary/30 transition-all flex items-center justify-center gap-2 group"
                     >
                       <CheckCircle2 size={14} className="text-dash-secondary" />
-                      Dismiss Resolved Ticket from Dashboard
+                      Archive Closed Ticket
                     </button>
                   )}
                   

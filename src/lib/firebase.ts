@@ -63,6 +63,8 @@ export interface Ticket {
   priority?: string;
   notes?: string;
   archived?: boolean; // For dismissing from board
+  content?: string; // Full text content for display
+  htmlContent?: string;
 }
 
 export type TicketInput = Omit<Ticket, 'id' | 'createdAt' | 'updatedAt' | 'userId'>;
@@ -75,10 +77,12 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   address: string; 
   visitDate: string;
   brief: string;
+  content: string;
 } {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   const bodyText = (doc.body?.innerText || html).replace(/\s+/g, ' ').trim();
+  const fullContent = (doc.body?.innerHTML || html);
   
   // 1. Extraction from Subject Line
   let ticketNumber = '';
@@ -188,68 +192,111 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   // Extract a "brief" - find the first meaningful block of text
   let brief = '';
   
-  // Try to find a "Message" or "Update" block first
-  const meaningfulMarkers = ['message:', 'update:', 'summary:', 'description:', 'latest update:'];
-  for (const marker of meaningfulMarkers) {
-    const idx = bodyText.toLowerCase().indexOf(marker);
-    if (idx !== -1) {
-      const remaining = bodyText.substring(idx + marker.length).trim();
-      // Take up to the next marker or signature
-      const signatureIdx = remaining.search(/\b(thanks|thank you|sincerely|best|regards|reguards|sent from|this email|confidentiality notice)\b/i);
-      brief = signatureIdx !== -1 ? remaining.substring(0, signatureIdx).trim() : remaining.substring(0, 300).trim();
-      break;
+  // High priority: check for specific status sentences to include them in the brief
+  const statusPhrases = [
+    'confirmed the request has been completed',
+    'completed on their end',
+    'completed on our end',
+    'request has been completed',
+    'shipped the amp',
+    'FedEx is estimating it should arrive',
+    'ready to be picked up'
+  ];
+
+  for (const phrase of statusPhrases) {
+    if (bodyText.toLowerCase().includes(phrase)) {
+      // Find the sentence containing this phrase
+      const sentences = bodyText.split(/[.!?]+/);
+      const matchingSentence = sentences.find(s => s.toLowerCase().includes(phrase));
+      if (matchingSentence) {
+        brief = matchingSentence.trim() + '.';
+        break;
+      }
+    }
+  }
+
+  if (!brief) {
+    // Try to find a "Message" or "Update" block
+    const meaningfulMarkers = ['message:', 'update:', 'summary:', 'description:', 'latest update:', 'updated by'];
+    for (const marker of meaningfulMarkers) {
+      const idx = bodyText.toLowerCase().indexOf(marker);
+      if (idx !== -1) {
+        const remaining = bodyText.substring(idx + marker.length).trim();
+        // Skip names if marker was "updated by"
+        let actualText = remaining;
+        if (marker === 'updated by') {
+          const firstColon = remaining.indexOf(':');
+          if (firstColon !== -1 && firstColon < 50) {
+            actualText = remaining.substring(firstColon + 1).trim();
+          }
+        }
+        
+        const signatureIdx = actualText.search(/\b(thanks|thank you|sincerely|best|regards|reguards|sent from|this email|confidentiality notice)\b/i);
+        brief = signatureIdx !== -1 ? actualText.substring(0, signatureIdx).trim() : actualText.substring(0, 300).trim();
+        break;
+      }
     }
   }
 
   if (!brief) {
     // Look for pleasantries
-    const welcomeMatch = bodyText.match(/(?:Good afternoon|Good morning|Hello|Hi)\s+[^,]+,\s*(.+)/i);
+    const welcomeMatch = bodyText.match(/(?:Good afternoon|Good morning|Hello|Hi)\s+[^,]+,\s*(.+)/i) ||
+                         bodyText.match(/(?:Good afternoon|Good morning|Hello|Hi),\s*(.+)/i);
     if (welcomeMatch) {
-      const remaining = welcomeMatch[1].trim();
+      const remaining = (welcomeMatch[1] || '').trim();
       const signatureIdx = remaining.search(/\b(thanks|thank you|sincerely|best|regards|reguards|sent from|this email|confidentiality notice)\b/i);
       brief = signatureIdx !== -1 ? remaining.substring(0, signatureIdx).trim() : remaining.substring(0, 300).trim();
     }
   }
 
   if (!brief) {
-    // Fallback: take first 200-300 chars but skip common headers if they are stuck at the top
-    let cleanedFallback = bodyText.replace(/^(?:from|sent|to|cc|subject|importance|priority):.*$/gmi, '').trim();
-    brief = cleanedFallback.substring(0, 250).trim();
-    if (cleanedFallback.length > 250) brief += '...';
+    // Fallback: take first block of text from 3rd line or so (skipping headers)
+    let lines = bodyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    let candidate = lines.find(l => l.length > 40 && !l.includes(':'));
+    if (candidate) {
+      brief = candidate;
+    } else {
+      let cleanedFallback = bodyText.replace(/^(?:from|sent|to|cc|subject|importance|priority):.*$/gmi, '').trim();
+      brief = cleanedFallback.substring(0, 250).trim();
+      if (cleanedFallback.length > 250) brief += '...';
+    }
   }
 
-  // Final cleanup of the brief (remove extra spaces, weird chars)
-  brief = brief.replace(/\s+/g, ' ').trim();
+  // Final cleanup of the brief
+  brief = brief.replace(/\s+/g, ' ').replace(/^["']+|["']+$/g, '').trim();
+  if (brief.length > 400) brief = brief.substring(0, 397) + '...';
 
   return { 
     ticketNumber, 
     subject: subject || (ticketNumber ? `Support Ticket ${ticketNumber}` : 'Support Request'), 
-    status: statusRaw || 'Open',
+    status: getStatusFromSubject(subject, statusRaw, brief),
     contactName: contactName || '',
     address: address || '',
     visitDate: visitDate || '',
-    brief
+    brief,
+    content: bodyText,
+    htmlContent: html
   };
 }
 
 export function getStatusFromSubject(subject: string, statusRaw?: string, bodyContent?: string): string {
-  const combined = (subject + (bodyContent ? ' ' + bodyContent : '')).toLowerCase();
+  const combined = (subject + ' ' + (bodyContent || '')).toLowerCase();
   
-  // High priority: Body content keywords indicating completion
-  if (combined.includes('completed') || 
-      combined.includes('confirmed') || 
-      combined.includes('solved') || 
-      combined.includes('done') || 
-      combined.includes('closed') || 
-      combined.includes('resolved') ||
-      combined.includes('completed on our end') ||
-      combined.includes('request has been completed') ||
-      combined.includes('confirmed the request has been completed')) {
+  // Terminal status keywords (Done/Resolved)
+  const doneKeywords = [
+    'completed', 'confirmed', 'solved', 'done', 'closed', 'resolved',
+    'completed on our end', 'completed on their end', 
+    'request has been completed', 'confirmed the request has been completed',
+    'request has been closed', 'fix has been applied', 'issue is resolved',
+    'thank you for your help'
+  ];
+
+  if (doneKeywords.some(keyword => combined.includes(keyword))) {
     return 'Done';
   }
 
-  // Backup: statusRaw from header if it's specific
-  if (statusRaw && statusRaw.trim() && !statusRaw.toLowerCase().includes('open')) {
+  // Backup: specific statusRaw from Gmail / Ticket header
+  if (statusRaw && statusRaw.trim() && !statusRaw.toLowerCase().includes('open') && !statusRaw.toLowerCase().includes('new')) {
     return statusRaw.trim();
   }
   
