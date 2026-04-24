@@ -23,7 +23,11 @@ import {
   FileText,
   Mail,
   RefreshCw,
-  Download
+  Download,
+  ListChecks,
+  ShieldAlert,
+  Upload,
+  History
 } from 'lucide-react';
 import { 
   format, 
@@ -43,6 +47,7 @@ import {
 import { useAuth, useTickets } from './lib/hooks';
 import { 
   loginWithGoogle, 
+  getGmailToken,
   logout, 
   getStatusFromSubject, 
   parseEmailHTML,
@@ -58,21 +63,27 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-function StatusBadge({ status }: { status: Ticket['status'] }) {
-  const styles = {
-    'Done': 'bg-dash-secondary/20 text-dash-secondary border-dash-secondary/30',
-    'In Progress': 'bg-dash-gold/20 text-dash-gold border-dash-gold/30',
-    'Visit Scheduled': 'bg-dash-accent text-white border-dash-accent',
-    'Open': 'bg-dash-blue/20 text-dash-blue border-dash-blue/30',
-  };
+function StatusBadge({ status }: { status: string }) {
+  const s = status.toLowerCase();
+  const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed');
+  const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit');
+  
+  let dotColor = 'bg-red-500 shadow-red-500/50';
+  let bgColor = 'bg-red-500/10 text-red-500 border-red-500/20';
+  
+  if (isResolved) {
+    dotColor = 'bg-green-500 shadow-green-500/50';
+    bgColor = 'bg-green-500/10 text-green-500 border-green-500/20';
+  } else if (isInProgress) {
+    dotColor = 'bg-orange-500 shadow-orange-500/50';
+    bgColor = 'bg-orange-500/10 text-orange-500 border-orange-500/20';
+  }
 
   return (
-    <span className={cn(
-      "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-widest border w-fit",
-      styles[status]
-    )}>
+    <div className={cn("flex items-center gap-2 px-3 py-1 rounded-full border text-[9px] font-black uppercase tracking-widest w-fit", bgColor)}>
+      <div className={cn("w-2 h-2 rounded-full animate-pulse shadow-[0_0_10px_rgba(34,197,94,0.7)]", dotColor)} />
       {status}
-    </span>
+    </div>
   );
 }
 
@@ -80,10 +91,15 @@ export default function App() {
   const { user, loading: authLoading } = useAuth();
   const [isViewer, setIsViewer] = useState(false);
   const [pin, setPin] = useState('');
+  const [adminLevel, setAdminLevel] = useState<'assistant' | 'full' | null>(null);
   const [loginMode, setLoginMode] = useState<'admin' | 'viewer'>('admin');
+  const [autoSync, setAutoSync] = useState(false);
   
-  const isAdmin = !!user;
-  const isAuthenticated = isAdmin || isViewer;
+  const isAdmin = !!user || adminLevel === 'full';
+  const isAssistant = adminLevel === 'assistant';
+  const isAuthenticated = isAdmin || isAssistant || isViewer;
+  const canAccessFullAdmin = adminLevel === 'full' || (user?.email === 'iltapp2026@gmail.com');
+  const canAccessAdmin = isAdmin || isAssistant;
   
   // If admin, they see their own (or all if we want shared). 
   // User says "my team can access it", so let's make it shared.
@@ -97,10 +113,19 @@ export default function App() {
   const [statusFilter, setStatusFilter] = useState<Ticket['status'] | 'All'>('All');
   const [view, setView] = useState<'dashboard' | 'activity' | 'reports'>('dashboard');
   const [isAddOpen, setIsAddOpen] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [weekOffset, setWeekOffset] = useState(0);
+
+  // Import related state
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [importMode, setImportMode] = useState<'gmail' | 'manual'>('gmail');
+  const [manualContent, setManualContent] = useState('');
+  const [manualTicketNumber, setManualTicketNumber] = useState('');
+  const [selectableEmails, setSelectableEmails] = useState<any[]>([]);
+  const [selectedEmailIds, setSelectedEmailIds] = useState<Set<string>>(new Set());
+  const [isFetchingEmails, setIsFetchingEmails] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
 
   const selectedWeek = useMemo(() => {
     const d = addWeeks(new Date(), weekOffset);
@@ -110,16 +135,24 @@ export default function App() {
     };
   }, [weekOffset]);
 
+
   const activityGroups = useMemo(() => {
+    const today = startOfDay(new Date());
     const weekTickets = tickets.filter(t => {
       const date = t.updatedAt?.toDate ? t.updatedAt.toDate() : new Date();
       return isWithinInterval(date, selectedWeek);
     });
 
     return {
-      completed: weekTickets.filter(t => t.status === 'Done'),
-      scheduled: tickets.filter(t => t.status === 'Visit Scheduled' && t.visitDate && isSameWeek(new Date(t.visitDate), selectedWeek.start, { weekStartsOn: 1 })),
-      waiting: weekTickets.filter(t => t.status === 'In Progress' || t.status === 'Open'),
+      completed: weekTickets.filter(t => t.status.toLowerCase().includes('done') || t.status.toLowerCase().includes('complete')),
+      scheduled: tickets.filter(t => {
+        const d = t.visitDate ? new Date(t.visitDate) : null;
+        return (t.status.toLowerCase().includes('visit') || t.status.toLowerCase().includes('scheduled')) && 
+               d && 
+               (isSameDay(d, today) || d > today) &&
+               isWithinInterval(d, selectedWeek);
+      }),
+      waiting: weekTickets.filter(t => !t.status.toLowerCase().includes('done')),
       updated: weekTickets.sort((a, b) => {
         const da = a.updatedAt?.toDate ? a.updatedAt.toDate().getTime() : 0;
         const db = b.updatedAt?.toDate ? b.updatedAt.toDate().getTime() : 0;
@@ -140,7 +173,8 @@ export default function App() {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       const matchesStatus = statusFilter === 'All' || t.status === statusFilter;
-      return matchesSearch && matchesStatus;
+      const notArchived = !t.archived;
+      return matchesSearch && matchesStatus && notArchived;
     });
   }, [tickets, search, statusFilter]);
 
@@ -153,8 +187,13 @@ export default function App() {
   }), [tickets]);
 
   const upcomingVisits = useMemo(() => {
+    const today = startOfDay(new Date());
     return tickets
-      .filter(t => t.status === 'Visit Scheduled' && t.visitDate)
+      .filter(t => (t.status.toLowerCase().includes('visit') || t.status.toLowerCase().includes('scheduled')) && t.visitDate)
+      .filter(t => {
+        const d = new Date(t.visitDate!);
+        return !isNaN(d.getTime()) && (isSameDay(d, today) || d > today);
+      })
       .sort((a, b) => new Date(a.visitDate!).getTime() - new Date(b.visitDate!).getTime());
   }, [tickets]);
 
@@ -224,115 +263,305 @@ export default function App() {
   };
 
   const handleLogout = () => {
-    localStorage.removeItem('gmailToken');
-    localStorage.removeItem('lastAutoSync');
-    setSyncStatus(null);
+    sessionStorage.removeItem('gmail_access_token');
+    setImportStatus(null);
     logout();
   };
 
-  const syncGmail = () => {
-    if (isSyncing) return;
-    setIsSyncing(true);
-    setSyncStatus('Connecting to Gmail...');
+  const [importQuery, setImportQuery] = useState('Splendid OR Ticket OR jseefenkhalil');
 
-    // Use environment variable if available, otherwise fallback.
-    // In AIS, we might not have it in env, so we use the one derived from the project if possible.
-    const CLIENT_ID = (import.meta as any).env.VITE_GOOGLE_CLIENT_ID || '398175493670-igb2ojljtyalzueabf5asj.apps.googleusercontent.com'; 
-    const SCOPES = 'https://www.googleapis.com/auth/gmail.readonly';
+  const fetchEmailsForImport = async (queryOverride?: string) => {
+    if (isFetchingEmails) return;
+    
+    // Explicit check for viewers
+    if (isViewer && !user) {
+      setImportStatus('Viewer mode cannot access Gmail. Please login as Admin.');
+      setIsImportModalOpen(true);
+      setImportMode('manual');
+      return;
+    }
+
+    setIsFetchingEmails(true);
+    setImportStatus('Authenticating...');
+    setIsImportModalOpen(true);
+    setImportMode('gmail');
+    setSelectableEmails([]);
+    setSelectedEmailIds(new Set());
+    
+    try {
+      const accessToken = await getGmailToken();
+      if (!accessToken) {
+        setImportStatus('Please authorize Gmail access to continue.');
+        setIsFetchingEmails(false);
+        return;
+      }
+      
+      const today = new Date();
+      const afterDate = format(today, 'yyyy/MM/dd');
+      const query = (typeof queryOverride === 'string') ? queryOverride : importQuery;
+      // Filter for tickets received today
+      const finalQuery = `${query} after:${afterDate}`;
+      
+      setImportStatus(`Searching today's emails: ${finalQuery}...`);
+      
+      const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(finalQuery)}&maxResults=50`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      
+      if (!searchRes.ok) {
+        const errData = await searchRes.json();
+        throw new Error(errData.error?.message || `Search failed: ${searchRes.statusText}`);
+      }
+      
+      const searchData = await searchRes.json();
+
+      if (!searchData.messages || searchData.messages.length === 0) {
+        setImportStatus(`No new tickets found for ${afterDate}.`);
+        setIsFetchingEmails(false);
+        return;
+      }
+
+      const emailDetails = [];
+      const existingTicketNumbers = new Set(tickets.map(t => t.ticketNumber));
+
+      for (const msg of searchData.messages) {
+        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=minimal`, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        
+        if (!detailRes.ok) {
+           console.error(`Failed to fetch message ${msg.id}`);
+           continue; 
+        }
+
+        const detailData = await detailRes.json();
+        
+        const headers = detailData.payload?.headers || [];
+        const subject = headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || 'No Subject';
+        const date = headers.find((h: any) => h.name.toLowerCase() === 'date')?.value || '';
+
+        // Check for duplicates by ticket number in subject or snippet
+        const ticketMatch = subject.match(/Ticket#(\d+)/i) || detailData.snippet.match(/Ticket#\s*(\d+)/i);
+        const ticketNum = ticketMatch ? ticketMatch[1] : null;
+
+        if (ticketNum && existingTicketNumbers.has(ticketNum)) {
+          continue; // Skip already imported
+        }
+
+        emailDetails.push({
+          id: msg.id,
+          subject,
+          snippet: detailData.snippet,
+          date: date ? new Date(date) : new Date(),
+          ticketNumber: ticketNum
+        });
+      }
+
+      if (emailDetails.length === 0) {
+        setImportStatus("All found tickets for today are already imported.");
+      } else {
+        setSelectableEmails(emailDetails.sort((a, b) => b.date.getTime() - a.date.getTime()));
+        setImportStatus(null);
+      }
+    } catch (error: any) {
+      console.error(error);
+      setImportStatus(error.message || 'Error fetching emails.');
+    } finally {
+      setIsFetchingEmails(false);
+    }
+  };
+
+  const importManualContent = async () => {
+    if (!manualContent.trim() || isImporting) return;
+    setIsImporting(true);
+    setImportStatus('Parsing content...');
 
     try {
-      // @ts-ignore
-      const client = google.accounts.oauth2.initTokenClient({
-        client_id: CLIENT_ID,
-        scope: SCOPES,
-        callback: async (response: any) => {
-          if (response.error) {
-            setSyncStatus('Auth Error: ' + response.error);
-            setIsSyncing(false);
+      const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief } = parseEmailHTML(manualContent, '');
+      
+      const ticketNumber = manualTicketNumber.trim() || parsedNumber;
+
+      if (ticketNumber && (subject || manualContent.length > 50)) {
+          const ticketSub = subject || "Manual Import - " + ticketNumber;
+        const normalizedNumber = ticketNumber.trim();
+        const existing = tickets.find(t => t.ticketNumber === normalizedNumber);
+        
+        if (!existing) {
+          if (!user && !adminLevel) {
+            setImportStatus('You must be logged in as Admin to import.');
+            setIsImporting(false);
             return;
           }
+          await addDoc(collection(db, 'tickets'), {
+            ticketNumber: normalizedNumber,
+            subject: ticketSub,
+            status: status || 'Open',
+            brief: brief || '',
+            visitDate: vDate || null,
+            contactName: cName || '',
+            address: addr || '',
+            userId: user?.uid || adminLevel || 'SYSTEM',
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+            priority: 'Medium',
+            notes: `Manually imported at ${new Date().toLocaleString()}`,
+          });
+          setImportStatus('Ticket imported successfully!');
+        } else {
+          setImportStatus(`Ticket #${normalizedNumber} already exists. Record preserved.`);
+        }
+      } else {
+        setImportStatus('Could not find ticket number. Please enter it manually below.');
+      }
 
-          const accessToken = response.access_token;
-          setSyncStatus('Searching for Splendid emails...');
-
-          try {
-            const query = 'support@splendidtechnology.com jseefenkhalil@iltexas.org';
-            const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=30`, {
-              headers: { Authorization: `Bearer ${accessToken}` }
-            });
-            const searchData = await searchRes.json();
-
-            if (!searchData.messages) {
-              setSyncStatus('No emails found.');
-              setIsSyncing(false);
-              return;
-            }
-
-            let foundCount = 0;
-            let newCount = 0;
-
-            for (const msg of searchData.messages) {
-              setSyncStatus(`Reading message ${++foundCount}/${searchData.messages.length}...`);
-              const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`, {
-                headers: { Authorization: `Bearer ${accessToken}` }
-              });
-              const detailData = await detailRes.json();
-
-              let html = '';
-              const parts = detailData.payload.parts || [detailData.payload];
-              for (const part of parts) {
-                if (part.mimeType === 'text/html' && part.body.data) {
-                  html = atob(part.body.data.replace(/-/g, '+').replace(/_/g, '/'));
-                  break;
-                }
-                if (part.parts) {
-                   for (const subPart of part.parts) {
-                     if (subPart.mimeType === 'text/html' && subPart.body.data) {
-                       html = atob(subPart.body.data.replace(/-/g, '+').replace(/_/g, '/'));
-                       break;
-                     }
-                   }
-                }
-              }
-
-              if (html) {
-                const { ticketNumber, subject, status, contactName: cName, address: addr, visitDate: vDate } = parseEmailHTML(html);
-                if (ticketNumber && subject) {
-                  const existing = tickets.find(t => t.ticketNumber === ticketNumber);
-                  if (!existing) {
-                    await addDoc(collection(db, 'tickets'), {
-                      ticketNumber,
-                      subject,
-                      status: getStatusFromSubject(subject, status),
-                      visitDate: vDate || null,
-                      contactName: cName || null,
-                      address: addr || null,
-                      userId: user?.uid || 'SYSTEM',
-                      createdAt: serverTimestamp(),
-                      updatedAt: serverTimestamp(),
-                    });
-                    newCount++;
-                  }
-                }
-              }
-            }
-
-            setSyncStatus(`Sync Complete! Found ${newCount} new tickets.`);
-            setTimeout(() => setSyncStatus(null), 5000);
-          } catch (error) {
-            console.error(error);
-            setSyncStatus('Sync Error: Failed to fetch Gmail data.');
-          } finally {
-            setIsSyncing(false);
-          }
-        },
-      });
-      client.requestAccessToken();
+      setTimeout(() => {
+        setImportStatus(null);
+        if (importStatus?.includes('successfully')) {
+          setManualContent('');
+          setManualTicketNumber('');
+          setIsImportModalOpen(false);
+        }
+      }, 3000);
     } catch (error) {
       console.error(error);
-      setSyncStatus('GIS Library Error.');
-      setIsSyncing(false);
+      setImportStatus('Error parsing content.');
+    } finally {
+      setIsImporting(false);
     }
+  };
+
+  const importSelectedEmails = async () => {
+    if (isImporting || selectedEmailIds.size === 0) return;
+    setIsImporting(true);
+    setImportStatus(`Importing ${selectedEmailIds.size} tickets...`);
+    
+    try {
+      const accessToken = await getGmailToken();
+      if (!accessToken) return;
+
+      let newCount = 0;
+      const idsToProcess = Array.from(selectedEmailIds);
+
+      for (let i = 0; i < idsToProcess.length; i++) {
+        const msgId = idsToProcess[i];
+        setImportStatus(`Processing email ${i + 1}/${idsToProcess.length}...`);
+        
+        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}`, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        const detailData = await detailRes.json();
+
+        const headers = detailData.payload.headers;
+        const outerSubject = headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || '';
+
+        let htmlContent = '';
+        let innerSubject = outerSubject;
+
+        const findAttachmentParts = (parts: any[]): any[] => {
+          let results: any[] = [];
+          for (const p of parts) {
+            const isEml = p.filename && p.filename.toLowerCase().includes('ticket');
+            const isRfc = p.mimeType === 'message/rfc822';
+            const hasId = p.body && p.body.attachmentId;
+            
+            if (isEml || isRfc || hasId) results.push(p);
+            if (p.parts) results = results.concat(findAttachmentParts(p.parts));
+          }
+          return results;
+        };
+
+        const attachments = findAttachmentParts(detailData.payload.parts || [detailData.payload]);
+        
+        if (attachments.length === 0) {
+           const getBody = (parts: any[]): string => {
+             for (const p of parts) {
+               if (p.mimeType === 'text/html' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+               if (p.parts) {
+                 const b = getBody(p.parts);
+                 if (b) return b;
+               }
+             }
+             return '';
+           };
+           htmlContent = getBody(detailData.payload.parts || [detailData.payload]);
+        }
+
+        for (const emlPart of attachments) {
+          if (emlPart.body.attachmentId) {
+            const attachRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/attachments/${emlPart.body.attachmentId}`, {
+              headers: { Authorization: `Bearer ${accessToken}` }
+            });
+            const attachData = await attachRes.json();
+            
+            if (attachData.data) {
+              const rawEml = atob(attachData.data.replace(/-/g, '+').replace(/_/g, '/'));
+              const emlSubMatch = rawEml.match(/^Subject:\s*(.*)/mi);
+              if (emlSubMatch) innerSubject = emlSubMatch[1].trim();
+
+              const htmlMatch = rawEml.match(/<html[\s\S]*?<\/html>/i);
+              if (htmlMatch) {
+                htmlContent = htmlMatch[0];
+              } else {
+                const parts = rawEml.split(/Content-Type:\s*text\/html/i);
+                if (parts.length > 1) {
+                  const afterHtmlHeader = parts[1];
+                  const boundaryMatch = afterHtmlHeader.match(/--[\w-]+/);
+                  htmlContent = boundaryMatch ? afterHtmlHeader.split(boundaryMatch[0])[0] : afterHtmlHeader;
+                }
+              }
+            }
+          }
+        }
+
+        if (htmlContent) {
+          const { ticketNumber: rawNum, subject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief } = parseEmailHTML(htmlContent, innerSubject);
+          const ticketNumber = rawNum.trim();
+          
+          if (ticketNumber && subject) {
+            const existing = tickets.find(t => t.ticketNumber === ticketNumber);
+            if (!existing) {
+              if (!user && !adminLevel) {
+                setImportStatus('Auth session expired. Please refresh.');
+                setIsImporting(false);
+                return;
+              }
+              const finalStatus = getStatusFromSubject(subject, rawStatus, brief);
+              await addDoc(collection(db, 'tickets'), {
+                ticketNumber,
+                subject,
+                status: finalStatus,
+                brief: brief || '',
+                visitDate: vDate || null,
+                contactName: cName || '',
+                address: addr || '',
+                userId: user?.uid || adminLevel || 'SYSTEM',
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+              newCount++;
+            }
+          }
+        }
+      }
+
+      setImportStatus(`Success! Imported ${newCount} tickets.`);
+      setTimeout(() => {
+        setImportStatus(null);
+        setIsImportModalOpen(false);
+      }, 3000);
+    } catch (error: any) {
+      console.error(error);
+      setImportStatus('Import failed.');
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const toggleEmailSelection = (id: string) => {
+    const newSelection = new Set(selectedEmailIds);
+    if (newSelection.has(id)) newSelection.delete(id);
+    else newSelection.add(id);
+    setSelectedEmailIds(newSelection);
   };
 
   const openEdit = (ticket: Ticket) => {
@@ -344,18 +573,6 @@ export default function App() {
     setAddress(ticket.address || '');
     setIsAddOpen(true);
   };
-
-  useEffect(() => {
-    if (isAdmin && view === 'dashboard' && !isSyncing && tickets.length > 0) {
-      const lastSync = localStorage.getItem('lastAutoSync');
-      const now = Date.now();
-      // Auto-sync once every 10 minutes session if possible
-      if (!lastSync || now - parseInt(lastSync) > 600000) {
-        syncGmail();
-        localStorage.setItem('lastAutoSync', now.toString());
-      }
-    }
-  }, [isAdmin, view]);
 
   if (authLoading) {
     return (
@@ -440,11 +657,13 @@ export default function App() {
                         const val = e.target.value.replace(/\D/g, '');
                         setPin(val);
                         if (val === '7324') {
-                          setIsViewer(true);
+                          setAdminLevel('assistant');
+                        } else if (val === '1974') {
+                          setAdminLevel('full');
                         }
                       }}
                     />
-                    {pin.length === 4 && pin !== '7324' && (
+                    {pin.length === 4 && pin !== '7324' && pin !== '1974' && (
                       <p className="text-dash-accent text-[10px] font-bold text-center mt-2 uppercase">Invalid Access PIN</p>
                     )}
                   </div>
@@ -488,9 +707,270 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* Import Modal */}
+      <AnimatePresence>
+        {isImportModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 bg-dash-bg/80 backdrop-blur-sm"
+              onClick={() => !isImporting && setIsImportModalOpen(false)}
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-2xl bg-dash-card border border-dash-border rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+            >
+              <div className="p-6 border-b border-dash-border flex flex-col gap-4 bg-dash-bg/50">
+                <div className="flex justify-between items-center">
+                  <div>
+                    <h2 className="text-xl font-black tracking-tight flex items-center gap-3 uppercase italic text-dash-accent">
+                      <Mail size={24} />
+                      Import Ticket
+                    </h2>
+                    <p className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mt-1">
+                      Choose a method to add a ticket record
+                    </p>
+                  </div>
+                  <button 
+                    onClick={() => setIsImportModalOpen(false)}
+                    disabled={isImporting}
+                    className="p-2 hover:bg-dash-bg rounded-full transition-colors text-dash-muted"
+                  >
+                    <X size={20} />
+                  </button>
+                </div>
+
+                <div className="flex gap-1 bg-dash-bg p-1 rounded-xl border border-dash-border">
+                  <button 
+                    onClick={() => setImportMode('gmail')}
+                    className={cn(
+                      "flex-1 py-2 text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all",
+                      importMode === 'gmail' ? "bg-dash-card border border-dash-border text-dash-accent" : "text-dash-muted hover:text-dash-text"
+                    )}
+                  >
+                    Gmail Search
+                  </button>
+                  <button 
+                    onClick={() => setImportMode('manual')}
+                    className={cn(
+                      "flex-1 py-2 text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all",
+                      importMode === 'manual' ? "bg-dash-card border border-dash-border text-dash-accent" : "text-dash-muted hover:text-dash-text"
+                    )}
+                  >
+                    Manual Paste
+                  </button>
+                </div>
+
+                {importMode === 'gmail' && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-dash-muted" size={14} />
+                        <input 
+                          type="text"
+                          value={importQuery}
+                          onChange={(e) => setImportQuery(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && fetchEmailsForImport()}
+                          placeholder="Search Gmail (e.g. jseefenkhalil or Ticket#)..."
+                          className="w-full bg-dash-bg border border-dash-border rounded-lg pl-9 pr-10 py-2 text-xs font-medium focus:ring-1 focus:ring-dash-accent focus:border-dash-accent transition-all outline-none"
+                        />
+                        {importQuery && (
+                          <button 
+                            onClick={() => setImportQuery('')}
+                            className="absolute right-3 top-1/2 -translate-y-1/2 text-dash-muted hover:text-dash-text transition-colors"
+                          >
+                            <X size={14} />
+                          </button>
+                        )}
+                      </div>
+                      <button 
+                        onClick={() => fetchEmailsForImport()}
+                        className="px-4 bg-dash-accent text-white rounded-lg text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/10"
+                      >
+                        Search Today
+                      </button>
+                    </div>
+                    {importStatus && (
+                      <div className="p-2 bg-dash-bg border border-dash-border rounded-lg">
+                        <p className={cn(
+                          "text-[9px] font-bold uppercase tracking-tighter",
+                          importStatus.toLowerCase().includes('unavailable') ? "text-red-500" : "text-dash-accent"
+                        )}>
+                          {importStatus}
+                        </p>
+                        {importStatus.toLowerCase().includes('unavailable') && (
+                          <p className="mt-1 text-[8px] text-dash-muted font-medium">
+                            Browsers sometimes block popups in iframes. Try clicking the "Open in New Tab" icon at the top right of this screen.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-4 flex flex-col">
+                {importMode === 'gmail' ? (
+                  <div className="space-y-2">
+                    {isFetchingEmails ? (
+                      <div className="py-20 text-center">
+                        <Loader2 className="w-8 h-8 animate-spin text-dash-accent mx-auto mb-4" />
+                        <p className="text-sm text-dash-muted font-medium italic">Scanning your inbox...</p>
+                      </div>
+                    ) : selectableEmails.length === 0 ? (
+                      <div className="py-20 text-center">
+                        <Mail className="w-12 h-12 text-dash-border mx-auto mb-4" />
+                        <p className="text-sm text-dash-muted italic">Ready to sync with Gmail.</p>
+                        <p className="text-[10px] text-dash-muted uppercase font-bold tracking-widest mt-4 mb-6">
+                           We search for Splendid ticket emails sent to your inbox.
+                        </p>
+                        <button 
+                          onClick={() => fetchEmailsForImport()}
+                          className="px-8 py-3 bg-dash-bg border border-dash-border rounded-xl text-xs font-bold uppercase tracking-widest hover:border-dash-accent hover:text-dash-accent transition-all"
+                        >
+                          Connect & Search Inbox
+                        </button>
+                      </div>
+                    ) : (
+                      selectableEmails.map((email) => (
+                        <div 
+                          key={email.id}
+                          onClick={() => !isImporting && toggleEmailSelection(email.id)}
+                          className={cn(
+                            "p-4 rounded-xl border transition-all cursor-pointer flex gap-4 items-start group",
+                            selectedEmailIds.has(email.id) 
+                              ? "bg-dash-accent/10 border-dash-accent shadow-sm" 
+                              : "bg-dash-bg/50 border-dash-border hover:border-dash-muted"
+                          )}
+                        >
+                          <div className={cn(
+                            "shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-all mt-0.5",
+                            selectedEmailIds.has(email.id) 
+                              ? "bg-dash-accent border-dash-accent" 
+                              : "border-dash-muted group-hover:border-dash-text"
+                          )}>
+                            {selectedEmailIds.has(email.id) && <CheckCircle2 size={12} className="text-white" />}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex justify-between items-start gap-2 mb-1">
+                              <h3 className={cn(
+                                "text-sm font-bold truncate transition-colors",
+                                selectedEmailIds.has(email.id) ? "text-dash-accent" : "text-dash-text"
+                              )}>
+                                {email.subject}
+                              </h3>
+                              <span className="text-[10px] text-dash-muted font-mono whitespace-nowrap mt-1">
+                                {format(email.date, 'MMM d, p')}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-dash-muted line-clamp-2 leading-relaxed italic">
+                              {email.snippet}
+                            </p>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex-1 flex flex-col gap-4">
+                    <div className="px-2 space-y-4">
+                      <p className="text-xs text-dash-muted italic">
+                        Copy the entire email content from Gmail and paste it here. We'll automatically extract the details.
+                      </p>
+                      <div className="grid grid-cols-1 gap-1.5">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-dash-muted px-1">Ticket Number (Use this if extraction fails)</label>
+                        <div className="relative">
+                          <input 
+                            type="text"
+                            value={manualTicketNumber}
+                            onChange={(e) => setManualTicketNumber(e.target.value)}
+                            placeholder="e.g. 92038"
+                            className="w-full bg-dash-bg border border-dash-border rounded-lg px-4 py-2 text-sm font-mono focus:ring-1 focus:ring-dash-accent transition-all outline-none"
+                          />
+                          <ListChecks className="absolute right-3 top-1/2 -translate-y-1/2 text-dash-muted/40" size={16} />
+                        </div>
+                      </div>
+                    </div>
+                    <textarea 
+                      value={manualContent}
+                      onChange={(e) => setManualContent(e.target.value)}
+                      placeholder="Paste email HTML or text here..."
+                      className="flex-1 w-full bg-dash-bg border border-dash-border rounded-xl p-4 text-xs font-medium resize-none focus:ring-1 focus:ring-dash-accent focus:border-dash-accent transition-all outline-none min-h-[250px]"
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="p-6 border-t border-dash-border bg-dash-bg/50 flex flex-col gap-4">
+                {importStatus && (
+                  <div className="flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest text-dash-accent animate-pulse">
+                    <Loader2 size={14} className="animate-spin" />
+                    {importStatus}
+                  </div>
+                )}
+                <div className="flex justify-between items-center">
+                  {importMode === 'gmail' ? (
+                    <>
+                      <p className="text-xs text-dash-muted font-bold uppercase tracking-widest">
+                        {selectedEmailIds.size} emails selected
+                      </p>
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => setIsImportModalOpen(false)}
+                          disabled={isImporting}
+                          className="px-6 py-2.5 text-xs font-bold uppercase tracking-widest text-dash-muted hover:text-dash-text transition-colors"
+                        >
+                          Cancel
+                        </button>
+                        <button 
+                          onClick={importSelectedEmails}
+                          disabled={isImporting || selectedEmailIds.size === 0}
+                          className="bg-dash-accent text-white px-8 py-2.5 rounded-lg text-xs font-bold uppercase tracking-widest shadow-lg shadow-dash-accent/20 hover:brightness-110 active:scale-[0.98] transition-all disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          {isImporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                          {isImporting ? 'Importing...' : 'Import Selected'}
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div />
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => {
+                            setManualContent('');
+                            setImportMode('gmail');
+                          }}
+                          disabled={isImporting}
+                          className="px-6 py-2.5 text-xs font-bold uppercase tracking-widest text-dash-muted hover:text-dash-text transition-colors"
+                        >
+                          Clear
+                        </button>
+                        <button 
+                          onClick={importManualContent}
+                          disabled={isImporting || !manualContent.trim()}
+                          className="bg-dash-accent text-white px-8 py-2.5 rounded-lg text-xs font-bold uppercase tracking-widest shadow-lg shadow-dash-accent/20 hover:brightness-110 active:scale-[0.98] transition-all disabled:opacity-50 disabled:grayscale disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          {isImporting ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                          {isImporting ? 'Parsing...' : 'Parse & Import'}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
-        <aside className="hidden lg:flex w-72 bg-dash-card border-r border-dash-border p-6 flex-col gap-8">
+        <aside className="hidden lg:flex w-72 bg-dash-card border-r border-dash-border p-6 flex-col gap-8 shrink-0">
           <div className="flex items-center gap-3 mb-2">
             <div className="w-8 h-8 bg-dash-accent rounded flex items-center justify-center font-bold text-white shadow-lg border border-white/20">STS</div>
             <h1 className="text-lg font-black tracking-tight italic text-dash-accent uppercase">Tracker</h1>
@@ -532,17 +1012,50 @@ export default function App() {
 
           <div className="mt-4">
             <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-3">System Actions</div>
-            <button 
-              onClick={syncGmail}
-              disabled={isSyncing}
-              className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest bg-dash-bg border border-dash-border hover:border-dash-accent transition-all group"
-            >
-              <RefreshCw size={14} className={cn("text-dash-accent transition-all", isSyncing && "animate-spin")} />
-              <span>{isSyncing ? 'Synchronizing...' : 'Sync Gmail Logs'}</span>
-            </button>
-            {syncStatus && (
+            {!isAdmin && !isAssistant ? (
+               <div className="px-3 py-4 bg-dash-bg border border-dash-border rounded-lg text-center">
+                 <p className="text-[9px] text-dash-muted uppercase font-bold mb-3">Admin Only Features</p>
+                 <button 
+                  onClick={() => {
+                    setAdminLevel(null);
+                    logout();
+                  }}
+                  className="w-full py-2 bg-dash-accent text-white text-[9px] font-bold uppercase tracking-widest rounded shadow-lg shadow-dash-accent/20"
+                >
+                  Switch to Admin
+                </button>
+               </div>
+            ) : (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[9px] text-dash-muted font-bold uppercase tracking-widest">Auto-Sync</span>
+                    <button 
+                        onClick={() => setAutoSync(!autoSync)}
+                        className={cn(
+                        "w-8 h-4 rounded-full transition-all relative",
+                        autoSync ? "bg-dash-accent" : "bg-dash-border"
+                        )}
+                    >
+                        <div className={cn(
+                        "absolute top-0.5 w-3 h-3 bg-white rounded-full transition-all",
+                        autoSync ? "right-0.5" : "left-0.5"
+                        )} />
+                    </button>
+                  </div>
+                  
+                  <button 
+                    onClick={fetchEmailsForImport}
+                    disabled={isFetchingEmails || isImporting}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[10px] font-bold uppercase tracking-widest bg-dash-bg border border-dash-border hover:border-dash-accent transition-all group"
+                  >
+                    <Mail size={14} className={cn("text-dash-accent transition-all", isFetchingEmails && "animate-pulse")} />
+                    <span>{isFetchingEmails ? 'Connecting...' : 'Sync Now'}</span>
+                  </button>
+                </div>
+            )}
+            {importStatus && !isImportModalOpen && (
               <div className="mt-2 px-2 text-[9px] font-bold text-dash-accent animate-pulse uppercase tracking-tighter">
-                {syncStatus}
+                {importStatus}
               </div>
             )}
           </div>
@@ -587,327 +1100,328 @@ export default function App() {
         </aside>
 
         {/* Main Content */}
-        <main className="flex-1 flex flex-col p-4 lg:p-8 gap-6 overflow-y-auto">
-          {view === 'dashboard' ? (
-            <>
-              {/* Top Stats */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                  <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1">Total Managed</div>
-                  <div className="text-2xl font-bold">{stats.total}</div>
-                </div>
-                <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                  <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-accent">Critical Open</div>
-                  <div className="text-2xl font-bold text-dash-accent">{stats.open.toString().padStart(2, '0')}</div>
-                </div>
-                <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                  <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-gold">In Transit</div>
-                  <div className="text-2xl font-bold text-dash-gold">{stats.progress.toString().padStart(2, '0')}</div>
-                </div>
-                <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
-                  <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-secondary">Resolved</div>
-                  <div className="text-2xl font-bold text-dash-secondary">{stats.done.toString().padStart(2, '0')}</div>
-                </div>
-              </div>
+        <main className="flex-1 flex flex-col overflow-hidden min-w-0">
+          <div className="flex-1 overflow-y-auto p-4 lg:p-8 scrollbar-dash">
+            {view === 'dashboard' ? (
+              <div className="flex gap-8 h-full">
+                <div className="flex-1 flex flex-col gap-6">
+                  {/* Top Stats */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
+                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1">Total Managed</div>
+                      <div className="text-2xl font-bold">{stats.total}</div>
+                    </div>
+                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
+                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-accent">Critical Open</div>
+                      <div className="text-2xl font-bold text-dash-accent">{stats.open.toString().padStart(2, '0')}</div>
+                    </div>
+                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
+                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-gold">In Transit</div>
+                      <div className="text-2xl font-bold text-dash-gold">{stats.progress.toString().padStart(2, '0')}</div>
+                    </div>
+                    <div className="bg-dash-card p-4 border border-dash-border rounded-xl shadow-sm">
+                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 text-dash-secondary">Resolved</div>
+                      <div className="text-2xl font-bold text-dash-secondary">{stats.done.toString().padStart(2, '0')}</div>
+                    </div>
+                  </div>
 
-              {/* Controls */}
-              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                <div className="flex gap-2 items-center flex-wrap">
-                  {['All', 'Open', 'In Progress', 'Visit Scheduled', 'Done'].map((st) => (
-                    <button
-                      key={st}
-                      onClick={() => setStatusFilter(st as any)}
-                      className={cn(
-                        "px-3 py-1.5 text-[10px] font-bold border rounded transition-all uppercase tracking-wider",
-                        statusFilter === st 
-                          ? "bg-dash-border border-dash-muted text-dash-text" 
-                          : "border-dash-border text-dash-muted hover:bg-dash-card"
-                      )}
-                    >
-                      {st}
-                    </button>
-                  ))}
-                </div>
-                <div className="relative group max-w-sm w-full lg:w-72">
-                  <Search size={14} className="absolute left-3 top-2.5 text-dash-muted group-focus-within:text-dash-accent transition-colors" />
-                  <input 
-                    type="text" 
-                    placeholder="Search ticket or subject..." 
-                    className="bg-dash-card border border-dash-border text-xs rounded px-10 py-2.5 w-full focus:outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                  />
-                </div>
-              </div>
+                  {/* Header/Controls */}
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                    <h1 className="text-2xl font-black italic tracking-tighter uppercase flex items-center gap-2">
+                       <LayoutDashboard className="text-dash-accent" />
+                       Operations
+                    </h1>
+                    <div className="flex items-center gap-3">
+                      <div className="relative group w-full lg:w-72">
+                        <Search size={14} className="absolute left-3 top-2.5 text-dash-muted group-focus-within:text-dash-accent transition-colors" />
+                        <input 
+                          type="text" 
+                          placeholder="Search identifier..." 
+                          className="bg-dash-card border border-dash-border text-xs rounded-xl px-10 py-2.5 w-full focus:outline-none focus:border-dash-accent transition-all"
+                          value={search}
+                          onChange={(e) => setSearch(e.target.value)}
+                        />
+                      </div>
+                      <button 
+                        onClick={() => {
+                          setEditingTicket(null);
+                          setTicketNumber('');
+                          setSubject('');
+                          setVisitDate('');
+                          setContactName('');
+                          setAddress('');
+                          setIsAddOpen(true);
+                        }}
+                        className="bg-dash-accent text-white h-10 px-4 rounded-xl shadow-lg shadow-dash-accent/20 flex items-center gap-2 hover:brightness-110 transition-all font-bold text-[10px] uppercase tracking-widest"
+                      >
+                        <Plus size={16} />
+                        Manual
+                      </button>
+                    </div>
+                  </div>
 
-              {/* Ticket Grid Table */}
-              <div className="bg-dash-card border border-dash-border rounded-xl flex-1 flex flex-col overflow-hidden min-h-[400px]">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="text-[10px] text-dash-muted uppercase tracking-widest border-b border-dash-border bg-dash-card/50">
-                        <th className="px-6 py-4 font-bold">Ticket Number</th>
-                        <th className="px-6 py-4 font-bold">Subject Line</th>
-                        <th className="px-6 py-4 font-bold">Status</th>
-                        <th className="px-6 py-4 font-bold text-right">Activity</th>
-                      </tr>
-                    </thead>
-                    <tbody className="text-xs divide-y divide-dash-border">
-                      {ticketsLoading ? (
-                        <tr>
-                          <td colSpan={4} className="px-6 py-20 text-center">
-                            <Loader2 className="w-6 h-6 animate-spin text-dash-muted mx-auto" />
-                          </td>
-                        </tr>
-                      ) : filteredTickets.length === 0 ? (
-                        <tr>
-                          <td colSpan={4} className="px-6 py-20 text-center text-dash-muted italic">
-                            No support tickets matching current filters.
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredTickets.map((t) => {
-                          const isTodayVisit = t.status === 'Visit Scheduled' && t.visitDate && isSameDay(new Date(t.visitDate), new Date());
-                          return (
-                            <tr 
-                              key={t.id} 
-                              onClick={() => openEdit(t)}
-                              className={cn(
-                                "hover:bg-dash-border/30 transition-colors cursor-pointer group",
-                                isTodayVisit && "alert-active border-l-4 border-l-dash-accent"
-                              )}
-                            >
-                              <td className="px-6 py-5 font-mono font-bold text-dash-muted group-hover:text-dash-text transition-colors">
-                                #{t.ticketNumber}
-                              </td>
-                              <td className="px-6 py-5">
-                                <div className="flex flex-col gap-0.5">
-                                  <span className="text-dash-text font-medium text-sm line-clamp-1">{t.subject}</span>
-                                  <div className="flex items-center gap-2 mt-0.5">
-                                    {t.contactName && (
-                                      <span className="text-[10px] text-dash-muted font-bold uppercase tracking-wider">{t.contactName}</span>
-                                    )}
-                                    {t.address && (
-                                      <>
-                                        { t.contactName && <span className="text-dash-muted">•</span> }
-                                        <span className="text-[10px] text-dash-muted italic">{t.address}</span>
-                                      </>
-                                    )}
-                                  </div>
-                                  {isTodayVisit && (
-                                    <span className="text-[10px] text-rose-400 font-bold uppercase tracking-tight">Alert: Visit Scheduled for Today</span>
-                                  )}
-                                  {t.visitDate && !isTodayVisit && (
-                                    <span className="text-[10px] text-rose-400 font-medium">Scheduled for: {t.visitDate}</span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className="px-6 py-5">
-                                <StatusBadge status={t.status} />
-                              </td>
-                              <td className="px-6 py-5 text-right">
-                                <div className="flex items-center justify-end gap-3">
-                                  <span className="text-[10px] text-dash-muted whitespace-nowrap hidden sm:inline">
-                                    {t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'MMM d, p') : 'Recent'}
-                                  </span>
-                                  {isAdmin && (
-                                    <button 
-                                      onClick={(e) => handleDelete(t.id, e)}
-                                      className="p-1 px-1.5 bg-dash-accent/10 text-dash-accent rounded opacity-0 group-hover:opacity-100 transition-all hover:bg-dash-accent hover:text-white"
-                                    >
-                                      <Trash2 size={12} />
-                                    </button>
-                                  )}
-                                </div>
+                  {/* Table/List */}
+                  <div className="bg-dash-card border border-dash-border rounded-3xl flex-1 flex flex-col overflow-hidden min-h-[400px]">
+                    <div className="overflow-x-auto h-full">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="text-[10px] text-dash-muted uppercase tracking-[0.2em] border-b border-dash-border bg-dash-card/50">
+                            <th className="px-6 py-5 font-black">Ref</th>
+                            <th className="px-6 py-5 font-black">Context</th>
+                            <th className="px-6 py-5 font-black">Status</th>
+                            <th className="px-6 py-5 font-black text-right">Modified</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-xs divide-y divide-dash-border">
+                          {ticketsLoading ? (
+                            <tr>
+                              <td colSpan={4} className="px-6 py-20 text-center">
+                                <Loader2 className="w-8 h-8 animate-spin text-dash-accent mx-auto" />
                               </td>
                             </tr>
-                          );
-                        })
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-                
-                <div className="mt-auto p-4 border-t border-dash-border bg-dash-bg flex justify-between items-center text-[10px] text-dash-muted uppercase font-bold tracking-widest">
-                  <span>Managed by Splendid System • {filteredTickets.length} items • {isAdmin ? 'ADMIN' : 'VIEWER'}</span>
-                  <div className="flex items-center gap-4">
-                    <span>Last sync: {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
-                </div>
-              </div>
-            </>
-          ) : view === 'activity' ? (
-            <div className="flex flex-col gap-8">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h2 className="text-2xl font-black tracking-tight flex items-center gap-3">
-                    <CalendarCheck className="text-dash-accent" />
-                    Activity Board
-                  </h2>
-                  <p className="text-dash-muted text-xs font-bold uppercase tracking-widest mt-1">
-                    Week of {format(selectedWeek.start, 'MMMM d')} - {format(selectedWeek.end, 'MMMM d, yyyy')}
-                  </p>
-                </div>
-                <div className="flex items-center gap-1 bg-dash-card border border-dash-border p-1 rounded-lg">
-                  <button onClick={() => setWeekOffset(v => v - 1)} className="p-2 hover:bg-dash-bg rounded transition-colors text-dash-muted">
-                    <ChevronRight size={18} className="rotate-180" />
-                  </button>
-                  <button onClick={() => setWeekOffset(0)} className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:text-dash-accent transition-colors">Current Week</button>
-                  <button onClick={() => setWeekOffset(v => v + 1)} className="p-2 hover:bg-dash-bg rounded transition-colors text-dash-muted">
-                    <ChevronRight size={18} />
-                  </button>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
-                {/* Completed */}
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-2 text-dash-secondary">
-                    <CheckCircle2 size={18} />
-                    <h3 className="text-xs font-black uppercase tracking-widest italic">Completed</h3>
-                    <span className="ml-auto text-[10px] font-bold py-0.5 px-2 bg-dash-secondary/10 border border-dash-secondary/20 rounded-full">{activityGroups.completed.length}</span>
-                  </div>
-                  <div className="space-y-3">
-                    {activityGroups.completed.map(t => (
-                      <div key={t.id} className="bg-white border border-dash-border p-4 rounded-xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
-                        <div className="text-[10px] font-mono text-dash-muted mb-1 font-bold">#{t.ticketNumber}</div>
-                        <div className="font-bold text-sm leading-tight mb-2 group-hover:text-dash-accent transition-colors">{t.subject}</div>
-                        <div className="text-[9px] text-dash-secondary font-black uppercase tracking-tighter">Ready for Monthly Record</div>
-                      </div>
-                    ))}
-                    {activityGroups.completed.length === 0 && <p className="text-[10px] text-dash-muted italic px-2">No tickets completed this interval.</p>}
-                  </div>
-                </div>
- 
-                {/* Scheduled */}
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-2 text-dash-accent">
-                    <Calendar size={18} />
-                    <h3 className="text-xs font-black uppercase tracking-widest italic">Scheduled</h3>
-                    <span className="ml-auto text-[10px] font-bold py-0.5 px-2 bg-dash-accent/10 border border-dash-accent/20 rounded-full">{activityGroups.scheduled.length}</span>
-                  </div>
-                  <div className="space-y-3">
-                    {activityGroups.scheduled.map(t => (
-                      <div key={t.id} className="bg-white border border-dash-accent/20 p-4 rounded-xl shadow-sm hover:shadow-md transition-all border-l-4 border-l-dash-accent cursor-pointer group" onClick={() => openEdit(t)}>
-                        <div className="text-[10px] font-mono text-dash-accent mb-1 font-black">VISIT: {t.visitDate}</div>
-                        <div className="font-bold text-sm leading-tight mb-1 group-hover:text-dash-accent transition-colors">{t.subject}</div>
-                        <div className="text-[10px] text-dash-muted uppercase font-bold">Ref #{t.ticketNumber}</div>
-                      </div>
-                    ))}
-                    {activityGroups.scheduled.length === 0 && <p className="text-[10px] text-dash-muted italic px-2">No visits logged for this interval.</p>}
-                  </div>
-                </div>
- 
-                {/* Waiting */}
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-2 text-dash-gold">
-                    <Clock size={18} />
-                    <h3 className="text-xs font-black uppercase tracking-widest italic">Waiting</h3>
-                    <span className="ml-auto text-[10px] font-bold py-0.5 px-2 bg-dash-gold/10 border border-dash-gold/20 rounded-full">{activityGroups.waiting.length}</span>
-                  </div>
-                  <div className="space-y-3">
-                    {activityGroups.waiting.map(t => (
-                      <div key={t.id} className="bg-white border border-dash-border p-4 rounded-xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
-                        <div className="text-[10px] font-mono text-dash-muted mb-1 font-bold">#{t.ticketNumber}</div>
-                        <div className="font-bold text-sm leading-tight mb-2 group-hover:text-dash-accent transition-colors">{t.subject}</div>
-                        <div className="flex items-center gap-2">
-                           <div className="w-1.5 h-1.5 rounded-full bg-dash-gold animate-pulse"></div>
-                           <span className="text-[9px] text-dash-gold font-black uppercase tracking-tighter">{t.status === 'In Progress' ? 'Pending Action' : 'In Review'}</span>
-                        </div>
-                      </div>
-                    ))}
-                    {activityGroups.waiting.length === 0 && <p className="text-[10px] text-dash-muted italic px-2">No active items in queue.</p>}
+                          ) : filteredTickets.length === 0 ? (
+                            <tr>
+                              <td colSpan={4} className="px-6 py-40 text-center text-dash-muted italic font-medium">
+                                No active payloads in current segment.
+                              </td>
+                            </tr>
+                          ) : (
+                            filteredTickets.map((t) => (
+                              <tr 
+                                key={t.id} 
+                                onClick={() => openEdit(t)}
+                                className={cn(
+                                  "hover:bg-dash-accent/5 transition-all cursor-pointer group",
+                                  t.status.toLowerCase().includes('visit') && isSameDay(new Date(t.visitDate!), new Date()) && "bg-dash-accent/10 border-l-4 border-l-dash-accent"
+                                )}
+                              >
+                                <td className="px-6 py-6 font-mono font-bold text-dash-muted group-hover:text-dash-text">
+                                  #{t.ticketNumber}
+                                </td>
+                                <td className="px-6 py-6">
+                                  <div className="flex flex-col gap-1">
+                                    <span className="text-dash-text font-bold text-sm tracking-tight">{t.subject}</span>
+                                    <div className="flex items-center gap-3">
+                                       {t.visitDate && <span className="text-[10px] text-dash-accent font-black uppercase bg-dash-accent/10 px-1.5 rounded">{t.visitDate}</span>}
+                                       {t.contactName && <span className="text-[10px] text-dash-muted font-bold uppercase truncate max-w-[150px]">{t.contactName}</span>}
+                                    </div>
+                                  </div>
+                                </td>
+                                <td className="px-6 py-6">
+                                  <StatusBadge status={t.status} />
+                                </td>
+                                <td className="px-6 py-6 text-right">
+                                   <div className="flex items-center justify-end gap-4">
+                                      <span className="text-[10px] text-dash-muted font-bold">{t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'HH:mm') : '-'}</span>
+                                      <ChevronRight size={16} className="text-dash-border group-hover:text-dash-accent transition-all" />
+                                   </div>
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
                 </div>
 
-                {/* Updated Log */}
-                <div className="flex flex-col gap-4">
-                  <div className="flex items-center gap-2 text-dash-accent">
-                    <Plus size={18} />
-                    <h3 className="text-xs font-bold uppercase tracking-widest">Recent Activity</h3>
-                  </div>
-                  <div className="bg-white border border-dash-border rounded-xl shadow-sm divide-y divide-dash-border overflow-hidden">
-                    {activityGroups.updated.map(t => (
-                      <div key={t.id} className="p-3 hover:bg-dash-bg transition-colors cursor-pointer" onClick={() => openEdit(t)}>
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-[10px] font-bold text-dash-accent">#{t.ticketNumber}</span>
-                          <span className="text-[9px] text-dash-muted uppercase font-bold">{t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'EEE p') : 'Just now'}</span>
-                        </div>
-                        <p className="text-xs text-dash-text line-clamp-1">{t.subject}</p>
+                {/* Scheduled Side Panel */}
+                <div className="hidden xl:flex flex-col w-80 shrink-0 gap-6">
+                   <div className="bg-dash-card border border-dash-border rounded-3xl overflow-hidden flex flex-col h-full shadow-2xl">
+                      <div className="p-6 bg-dash-accent text-white bg-gradient-to-br from-dash-accent to-[#7a1827]">
+                         <h2 className="text-xl font-black italic tracking-tighter uppercase leading-none">Schedule</h2>
+                         <p className="text-[9px] font-bold uppercase tracking-widest opacity-60 mt-1">Pending Field Visits</p>
                       </div>
-                    ))}
-                    {activityGroups.updated.length === 0 && <p className="p-4 text-[10px] text-dash-muted italic text-center">No recent updates logged.</p>}
-                  </div>
+                      <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-dash">
+                         {upcomingVisits.length === 0 ? (
+                           <div className="h-40 flex flex-col items-center justify-center opacity-30 text-center">
+                              <Calendar size={32} className="mb-2" />
+                              <p className="text-[9px] font-bold uppercase tracking-widest">No dates pending</p>
+                           </div>
+                         ) : (
+                            upcomingVisits.map(v => (
+                              <div key={v.id} onClick={() => openEdit(v)} className="bg-dash-bg/50 border border-dash-border p-4 rounded-2xl hover:border-dash-accent transition-all cursor-pointer group">
+                                 <div className="flex justify-between items-center mb-2">
+                                    <span className="text-[10px] font-mono font-bold text-dash-accent italic">#{v.ticketNumber}</span>
+                                    <span className="text-[9px] font-black uppercase text-dash-muted">{v.visitDate}</span>
+                                 </div>
+                                 <h4 className="text-[11px] font-bold text-dash-text line-clamp-2 leading-tight uppercase group-hover:text-dash-accent transition-colors">{v.subject}</h4>
+                              </div>
+                            ))
+                         )}
+                      </div>
+                   </div>
+                   
+                   <div className="bg-dash-card border border-dash-border rounded-3xl p-6 flex flex-col gap-4">
+                      <h3 className="text-[10px] font-black uppercase tracking-widest text-dash-muted">Operational Health</h3>
+                      <div className="flex items-center gap-3">
+                         <div className="w-1.5 h-1.5 rounded-full bg-dash-secondary animate-pulse" />
+                         <span className="text-[11px] font-bold text-dash-text">All systems nominal</span>
+                      </div>
+                      <div className="w-full bg-dash-border h-1 rounded-full overflow-hidden">
+                         <div className="bg-dash-accent w-[85%] h-full rounded-full" />
+                      </div>
+                   </div>
                 </div>
               </div>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-10 max-w-4xl">
-              <div>
-                <h2 className="text-2xl font-black tracking-tight flex items-center gap-3">
-                  <FileText className="text-dash-accent" />
-                  Annual Audit Reports
-                </h2>
-                <p className="text-dash-muted text-xs font-bold uppercase tracking-widest mt-1">
-                  Generate comprehensive data extracts for compliance and tracking.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div className="bg-dash-card border border-dash-border p-8 rounded-2xl shadow-sm space-y-6">
-                  <div className="w-12 h-12 bg-dash-accent/10 rounded-xl flex items-center justify-center text-dash-accent">
-                    <Download size={24} />
-                  </div>
+            ) : view === 'activity' ? (
+              <div className="flex flex-col gap-8 max-w-6xl mx-auto w-full">
+                <div className="flex items-center justify-between">
                   <div>
-                    <h3 className="font-bold text-lg mb-1">CSV Performance Data</h3>
-                    <p className="text-xs text-dash-muted leading-relaxed">
-                      Export all ticket records, status transitions, and visit schedules into a structured CSV format. 
-                      Ideal for monthly reporting or spreadsheet analysis.
+                    <h2 className="text-2xl font-black tracking-tight flex items-center gap-3 uppercase italic">
+                      <CalendarCheck className="text-dash-accent" />
+                      Operational Board
+                    </h2>
+                    <p className="text-dash-muted text-[10px] font-bold uppercase tracking-[0.2em] mt-1">
+                      {format(selectedWeek.start, 'MMM d')} - {format(selectedWeek.end, 'MMM d, yyyy')}
                     </p>
                   </div>
-                  <button 
-                    onClick={exportToCSV}
-                    className="w-full py-4 bg-dash-accent text-white rounded-xl font-bold text-xs uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/20 flex items-center justify-center gap-3"
-                  >
-                    <Download size={16} />
-                    Download Audit Report
-                  </button>
-                </div>
-
-                <div className="bg-dash-card border border-dash-border p-8 rounded-2xl shadow-sm space-y-6">
-                  <div className="w-12 h-12 bg-dash-gold/10 rounded-xl flex items-center justify-center text-dash-gold">
-                    <Mail size={24} />
+                  <div className="flex items-center gap-2 bg-dash-card border border-dash-border p-1 rounded-xl shadow-sm">
+                    <button onClick={() => setWeekOffset(v => v - 1)} className="p-2 hover:bg-dash-bg rounded-lg transition-all text-dash-muted">
+                      <ChevronRight size={18} className="rotate-180" />
+                    </button>
+                    <button onClick={() => setWeekOffset(0)} className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:text-dash-accent transition-colors border-x border-dash-border">Today</button>
+                    <button onClick={() => setWeekOffset(v => v + 1)} className="p-2 hover:bg-dash-bg rounded-lg transition-all text-dash-muted">
+                      <ChevronRight size={18} />
+                    </button>
                   </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                  {/* Scheduled Future */}
+                  <div className="flex flex-col gap-5">
+                    <div className="flex items-center gap-2 text-dash-accent">
+                      <Calendar size={18} />
+                      <h3 className="text-xs font-black uppercase tracking-widest italic">Upcoming Visits</h3>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-accent/10 border border-dash-accent/20 rounded-full">{activityGroups.scheduled.length}</span>
+                    </div>
+                    <div className="space-y-4">
+                      {activityGroups.scheduled.map(t => (
+                        <div key={t.id} className="bg-dash-card border border-dash-accent/20 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-dash-accent cursor-pointer group" onClick={() => openEdit(t)}>
+                          <div className="flex justify-between items-start mb-3">
+                            <span className="text-[10px] font-mono text-dash-accent font-black uppercase">{t.visitDate}</span>
+                            <span className="text-[9px] font-bold text-dash-muted uppercase">#{t.ticketNumber}</span>
+                          </div>
+                          <div className="font-bold text-sm leading-tight group-hover:text-dash-accent transition-colors mb-2 uppercase italic">{t.subject}</div>
+                          <div className="text-[10px] text-dash-muted font-medium truncate italic">{t.address || 'No location provided'}</div>
+                        </div>
+                      ))}
+                      {activityGroups.scheduled.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">No upcoming visits scheduled.</p>}
+                    </div>
+                  </div>
+   
+                  {/* Completed */}
+                  <div className="flex flex-col gap-5">
+                    <div className="flex items-center gap-2 text-dash-secondary">
+                      <CheckCircle2 size={18} />
+                      <h3 className="text-xs font-black uppercase tracking-widest italic">Resolved</h3>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-secondary/10 border border-dash-secondary/20 rounded-full">{activityGroups.completed.length}</span>
+                    </div>
+                    <div className="space-y-4">
+                      {activityGroups.completed.map(t => (
+                        <div key={t.id} className="bg-dash-card border border-dash-border p-5 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
+                          <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase tracking-tighter">Reference #{t.ticketNumber}</div>
+                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-dash-secondary transition-colors italic">{t.subject}</div>
+                          <div className="flex items-center gap-2 text-dash-secondary text-[10px] font-black uppercase">
+                             <div className="w-1.5 h-1.5 rounded-full bg-dash-secondary" />
+                             Marked Complete
+                          </div>
+                        </div>
+                      ))}
+                      {activityGroups.completed.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">Historical records cleared.</p>}
+                    </div>
+                  </div>
+   
+                  {/* Waiting */}
+                  <div className="flex flex-col gap-5">
+                    <div className="flex items-center gap-2 text-dash-gold">
+                      <Clock size={18} />
+                      <h3 className="text-xs font-black uppercase tracking-widest italic">Active Queue</h3>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-gold/10 border border-dash-gold/20 rounded-full">{activityGroups.waiting.length}</span>
+                    </div>
+                    <div className="space-y-4">
+                      {activityGroups.waiting.map(t => (
+                        <div key={t.id} className="bg-dash-card border border-dash-border p-5 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
+                          <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase">Ticket #{t.ticketNumber}</div>
+                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-dash-gold transition-colors">{t.subject}</div>
+                          <div className="flex items-center gap-2">
+                             <div className="w-1.5 h-1.5 rounded-full bg-dash-gold animate-pulse"></div>
+                             <span className="text-[9px] text-dash-gold font-black uppercase tracking-tight">Requires Attention</span>
+                          </div>
+                        </div>
+                      ))}
+                      {activityGroups.waiting.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">Queue currently clear.</p>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : (
+                <div className="flex flex-col gap-10 max-w-4xl mx-auto w-full">
                   <div>
-                    <h3 className="font-bold text-lg mb-1">Gmail Synchronization</h3>
-                    <p className="text-xs text-dash-muted leading-relaxed">
-                      Connect to your mailbox to automatically import tickets sent from support@splendidtechnology.com.
-                      The system detects HTML payloads and maps them to secure tracking objects.
+                    <h2 className="text-2xl font-black tracking-tight flex items-center gap-3 uppercase italic">
+                      <FileText className="text-dash-accent" />
+                      Annual Reporting
+                    </h2>
+                    <p className="text-dash-muted text-[10px] font-bold uppercase tracking-widest mt-1">
+                      Data Export Hub for Audit Readiness.
                     </p>
                   </div>
-                  <button 
-                    onClick={syncGmail}
-                    disabled={isSyncing}
-                    className="w-full py-4 bg-dash-gold text-white rounded-xl font-bold text-xs uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-gold/20 flex items-center justify-center gap-3 disabled:opacity-50"
-                  >
-                    <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
-                    {isSyncing ? 'Syncing...' : 'Run Auto-Sync'}
-                  </button>
+    
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="bg-dash-card border border-dash-border p-8 rounded-3xl shadow-sm space-y-6">
+                      <div className="w-12 h-12 bg-dash-accent/10 rounded-2xl flex items-center justify-center text-dash-accent">
+                        <Download size={24} />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-lg mb-1 italic uppercase tracking-tighter">CSV Performance Export</h3>
+                        <p className="text-xs text-dash-muted leading-relaxed">
+                          Export all ticket records, including site addresses and site contacts. 
+                          Data is filtered for the active operational period.
+                        </p>
+                      </div>
+                      <button 
+                        onClick={exportToCSV}
+                        className="w-full py-4 bg-dash-accent text-white rounded-xl font-bold text-xs uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/20 flex items-center justify-center gap-3"
+                      >
+                        <Download size={16} />
+                        Execute Download
+                      </button>
+                    </div>
+    
+                    <div className="bg-dash-card border border-dash-border p-8 rounded-3xl shadow-sm space-y-6">
+                      <div className="w-12 h-12 bg-dash-gold/10 rounded-2xl flex items-center justify-center text-dash-gold">
+                        <Mail size={24} />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-lg mb-1 italic uppercase tracking-tighter">Service Log Sync</h3>
+                        <p className="text-xs text-dash-muted leading-relaxed">
+                          Synchronize with the Splendid Technology service account.
+                          Duplicates are automatically filtered during the handshake.
+                        </p>
+                      </div>
+                      <button 
+                        onClick={fetchEmailsForImport}
+                        disabled={isFetchingEmails || isImporting}
+                        className="w-full py-4 bg-dash-accent text-white rounded-xl font-bold text-xs uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/20 flex items-center justify-center gap-3 disabled:opacity-50"
+                      >
+                        <Mail size={16} className={isFetchingEmails ? "animate-pulse" : ""} />
+                        {isFetchingEmails ? 'Initializing Sync...' : 'Sync Mailbox Logs'}
+                      </button>
+                    </div>
+                  </div>
+    
+                  <div className="bg-dash-card border border-dash-border p-8 rounded-3xl">
+                     <div className="flex items-center gap-3 mb-4 text-dash-muted">
+                       <AlertCircle size={18} />
+                       <h4 className="text-[10px] font-black uppercase tracking-widest">Compliance Notice</h4>
+                     </div>
+                     <p className="text-[10px] text-dash-muted leading-relaxed uppercase font-bold tracking-tighter opacity-50">
+                       All data remains permanent across reset operations unless a Factory Wipe is initiated by a Full Admin. 
+                       Audit reports are generated in real-time from the Firestore high-availability cluster.
+                     </p>
+                  </div>
                 </div>
-              </div>
-
-              <div className="bg-dash-secondary/5 border border-dash-secondary/20 p-6 rounded-2xl">
-                 <div className="flex items-center gap-3 mb-4 text-dash-secondary">
-                   <AlertCircle size={18} />
-                   <h4 className="text-[10px] font-black uppercase tracking-widest">Reporting Notice</h4>
-                 </div>
-                 <p className="text-[10px] text-dash-muted leading-relaxed uppercase font-bold tracking-tighter">
-                   Audit reports are generated from the secure cloud database. 
-                   Ensure all manual entries are finalized before exporting for accuracy. 
-                   Data is retained for the current fiscal year.
-                 </p>
-              </div>
-            </div>
-          )}
+            )}
+          </div>
         </main>
       </div>
 
@@ -932,94 +1446,90 @@ export default function App() {
               <div className="flex items-center justify-between mb-10">
                 <div className="flex items-center gap-3">
                    <div className="w-8 h-8 bg-dash-accent rounded flex items-center justify-center font-bold text-white text-sm">ST</div>
-                   <h2 className="text-xl font-bold tracking-tight">Ticket Details</h2>
+                   <h2 className="text-xl font-bold tracking-tight">Ticket Analyst</h2>
                 </div>
                 <button onClick={() => setIsAddOpen(false)} className="p-2 bg-dash-border rounded hover:bg-dash-muted transition-colors text-dash-text">
                   <X size={18} />
                 </button>
               </div>
 
-              <form onSubmit={handleSaveTicket} className="space-y-6">
+              <div className="space-y-6">
+                <div>
+                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Live Status</label>
+                   <StatusBadge status={getStatusFromSubject(subject, undefined, editingTicket?.brief)} />
+                </div>
+
+                {editingTicket?.brief ? (
+                  <div className="p-5 rounded-2xl bg-dash-accent/5 border border-dash-accent/10 relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-1 h-full bg-dash-accent" />
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-3">Intelligence Brief</label>
+                    <p className="text-sm leading-relaxed text-dash-text italic font-medium">"{editingTicket.brief}"</p>
+                  </div>
+                ) : (
+                  <div className="p-5 rounded-2xl bg-dash-bg border border-dash-border border-dashed relative">
+                    <p className="text-[10px] text-dash-muted uppercase font-bold tracking-widest text-center">No intelligence brief extracted</p>
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Record Identifier</label>
-                  <input 
-                    required
-                    readOnly
-                    type="text" 
-                    placeholder="Ticket Number (e.g. 12903)"
-                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all font-mono text-sm opacity-70 cursor-not-allowed"
-                    value={ticketNumber}
-                    onChange={(e) => setTicketNumber(e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Original Subject Context</label>
-                  <textarea 
-                    required
-                    rows={4}
-                    placeholder="Paste the email subject here..."
-                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all resize-none text-sm leading-relaxed"
-                    value={subject}
-                    onChange={(e) => setSubject(e.target.value)}
-                  />
-                  <div className="mt-2 p-3 rounded bg-dash-bg border border-dash-border">
-                    <p className="text-[10px] text-dash-muted italic flex items-center gap-2">
-                       <span className="w-1.5 h-1.5 rounded-full bg-dash-accent animate-pulse"></span>
-                       Heuristic Classification: <span className="font-bold text-dash-text uppercase">{getStatusFromSubject(subject)}</span>
-                    </p>
+                  <div 
+                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 font-mono text-sm opacity-70"
+                  >
+                    #{ticketNumber}
                   </div>
                 </div>
+
                 <div>
-                  <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Scheduled Intervention (Visits)</label>
-                  <input 
-                    type="date" 
-                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all text-sm color-scheme-dark"
-                    value={visitDate}
-                    onChange={(e) => setVisitDate(e.target.value)}
-                  />
+                  <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Subject Context</label>
+                  <div 
+                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm leading-relaxed min-h-[80px]"
+                  >
+                    {subject}
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Contact Name</label>
-                    <input 
-                      type="text" 
-                      placeholder="e.g. John Doe"
-                      className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all text-sm"
-                      value={contactName}
-                      onChange={(e) => setContactName(e.target.value)}
-                    />
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Campus Address</label>
+                    <div className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm min-h-[44px]">
+                      {address || 'N/A'}
+                    </div>
                   </div>
                   <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Campus Address</label>
-                    <input 
-                      type="text" 
-                      placeholder="e.g. Building A"
-                      className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 outline-none focus:ring-1 focus:ring-dash-accent/50 transition-all text-sm"
-                      value={address}
-                      onChange={(e) => setAddress(e.target.value)}
-                    />
+                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Visit Estimate</label>
+                    <div className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm min-h-[44px]">
+                      {visitDate || 'No schedule detected'}
+                    </div>
                   </div>
                 </div>
 
-                <div className="pt-6">
-                  <button 
-                    type="submit"
-                    className="w-full bg-dash-accent py-3.5 rounded font-bold text-sm uppercase tracking-widest hover:brightness-110 transition-all shadow-xl shadow-dash-accent/20"
-                  >
-                    Save Changes
-                  </button>
-                  {editingTicket && (
+                <div className="pt-10 space-y-4">
+                  {editingTicket && (getStatusFromSubject(subject).toLowerCase().includes('done') || getStatusFromSubject(subject).toLowerCase().includes('complete') || getStatusFromSubject(subject).toLowerCase().includes('resolve')) && (
                     <button 
                       type="button"
-                      onClick={() => setIsAddOpen(false)}
-                      className="w-full mt-3 py-3 text-[10px] font-bold uppercase tracking-widest text-dash-muted hover:text-dash-text transition-all"
+                      onClick={async () => {
+                        if (editingTicket) {
+                          await updateDoc(doc(db, 'tickets', editingTicket.id), { archived: true });
+                          setIsAddOpen(false);
+                        }
+                      }}
+                      className="w-full bg-dash-bg border border-dash-border py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:border-dash-accent transition-all flex items-center justify-center gap-2 group"
                     >
-                      Cancel Operation
+                      <CheckCircle2 size={14} className="text-dash-secondary" />
+                      Dismiss Resolved Ticket from Dashboard
                     </button>
                   )}
+                  
+                  <button 
+                    type="button"
+                    onClick={() => setIsAddOpen(false)}
+                    className="w-full py-4 text-[10px] font-black uppercase tracking-[0.2em] text-dash-muted hover:text-dash-text transition-all bg-dash-bg rounded-xl border border-dash-border"
+                  >
+                    Close Analysis
+                  </button>
                 </div>
-              </form>
+              </div>
             </motion.div>
           </>
         )}

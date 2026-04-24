@@ -1,6 +1,6 @@
 {
-  "name": "STS Ticket Tracker",
-  "description": "A dark-themed dashboard for tracking vendor support tickets with automatic status detection and visit alerts.",
+  "name": "STS Operational & Lending Hub",
+  "description": "Comprehensive operations dashboard featuring dynamic ticket tracking, Chromebook/charger lending system, and multi-tier admin controls.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }

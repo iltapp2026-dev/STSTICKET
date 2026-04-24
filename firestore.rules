@@ -11,8 +11,11 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isOwner(userId) {
-      return isSignedIn() && request.auth.uid == userId;
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'iltapp2026@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
     }
 
     function isValidId(id) {
@@ -30,16 +33,17 @@ service cloud.firestore {
     function isValidTicket(data) {
       return data.ticketNumber is string && data.ticketNumber.size() > 0 && data.ticketNumber.size() <= 100 &&
              data.subject is string && data.subject.size() > 0 && data.subject.size() <= 500 &&
-             data.status in ['Done', 'In Progress', 'Visit Scheduled', 'Open'] &&
              data.userId is string &&
-             (data.visitDate == null || (data.visitDate is string && data.visitDate.size() <= 50));
+             ( !('visitDate' in data) || data.visitDate == null || (data.visitDate is string && data.visitDate.size() <= 100) );
     }
 
     match /tickets/{ticketId} {
+      // Open read for everyone (shared board)
       allow read: if true;
       
+      // Allow create/update for any signed in user (any team member)
+      // or specifically the admin email.
       allow create: if isSignedIn() && 
-                    isValidId(ticketId) && 
                     isValidTicket(incoming()) && 
                     incoming().createdAt == request.time && 
                     incoming().updatedAt == request.time;
@@ -49,7 +53,7 @@ service cloud.firestore {
                     incoming().createdAt == existing().createdAt && 
                     incoming().updatedAt == request.time;
 
-      allow delete: if isSignedIn();
+      allow delete: if isAdmin();
     }
   }
 }
