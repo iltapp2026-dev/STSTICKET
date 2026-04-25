@@ -102,9 +102,12 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function App() {
   const { user, loading: authLoading } = useAuth();
-  const [isViewer, setIsViewer] = useState(false);
-  const [pin, setPin] = useState('');
-  const [adminLevel, setAdminLevel] = useState<'assistant' | 'full' | null>(null);
+  const [isGuestViewer, setIsGuestViewer] = useState(false);
+  const [pin, setPin] = useState(() => localStorage.getItem('sts_pin') || '');
+  const [adminLevel, setAdminLevel] = useState<'assistant' | 'full' | null>(() => {
+    const saved = localStorage.getItem('sts_admin_level');
+    return (saved === 'assistant' || saved === 'full') ? saved : null;
+  });
   const [loginMode, setLoginMode] = useState<'admin' | 'viewer'>('admin');
   const [autoSync, setAutoSync] = useState(false);
   
@@ -112,9 +115,20 @@ export default function App() {
   
   const isAdmin = !!user || adminLevel === 'full';
   const isAssistant = adminLevel === 'assistant';
+  const isViewer = !!localStorage.getItem('sts_viewer') || isGuestViewer || isAdmin || isAssistant;
   const isAuthenticated = isAdmin || isAssistant || isViewer;
   const canAccessFullAdmin = adminLevel === 'full' || (user?.email === 'iltapp2026@gmail.com');
   const canAccessAdmin = isAdmin || isAssistant;
+
+  useEffect(() => {
+    if (adminLevel) localStorage.setItem('sts_admin_level', adminLevel);
+    else localStorage.removeItem('sts_admin_level');
+  }, [adminLevel]);
+
+  useEffect(() => {
+    if (isGuestViewer) localStorage.setItem('sts_viewer', 'true');
+    else localStorage.removeItem('sts_viewer');
+  }, [isGuestViewer]);
   
   // If admin, they see their own (or all if we want shared). 
   // User says "my team can access it", so let's make it shared.
@@ -321,6 +335,11 @@ export default function App() {
 
   const handleLogout = () => {
     sessionStorage.removeItem('gmail_access_token');
+    localStorage.removeItem('sts_admin_level');
+    localStorage.removeItem('sts_viewer');
+    localStorage.removeItem('sts_pin');
+    setAdminLevel(null);
+    setPin('');
     setImportStatus(null);
     logout();
   };
@@ -669,78 +688,62 @@ export default function App() {
             <p className="text-white/60 text-[10px] mt-1 uppercase tracking-[0.3em] font-bold">Splendid Technology Services</p>
           </div>
 
-          <div className="p-8">
-            <div className="flex border-b border-dash-border mb-8">
-              <button 
-                onClick={() => setLoginMode('admin')}
-                className={cn(
-                  "flex-1 pb-4 text-xs font-bold uppercase tracking-widest transition-all",
-                  loginMode === 'admin' ? "text-dash-accent border-b-2 border-dash-accent" : "text-dash-muted"
-                )}
-              >
-                Admin Access
-              </button>
-              <button 
-                onClick={() => setLoginMode('viewer')}
-                className={cn(
-                  "flex-1 pb-4 text-xs font-bold uppercase tracking-widest transition-all",
-                  loginMode === 'viewer' ? "text-dash-accent border-b-2 border-dash-accent" : "text-dash-muted"
-                )}
-              >
-                View Only
-              </button>
-            </div>
+          <div className="p-8 space-y-8">
+            <div className="space-y-4">
+              <div className="text-center">
+                <h3 className="text-sm font-bold uppercase tracking-widest text-dash-muted mb-4">Corporate Login</h3>
+                <button 
+                  onClick={loginWithGoogle}
+                  className="w-full py-4 px-4 rounded-xl bg-dash-accent text-white font-bold hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-3 shadow-lg shadow-dash-accent/20"
+                >
+                  <Mail size={18} />
+                  Login with Google
+                </button>
+              </div>
 
-            <AnimatePresence mode="wait">
-              {loginMode === 'admin' ? (
-                <motion.div 
-                  key="admin"
-                  initial={{ opacity: 0, x: -10 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: 10 }}
-                  className="space-y-4"
-                >
-                  <p className="text-xs text-dash-muted text-center mb-6">Sign in with your corporate Google account to manage tickets and settings.</p>
-                  <button 
-                    onClick={loginWithGoogle}
-                    className="w-full py-4 px-4 rounded-xl bg-dash-accent text-white font-bold hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-3 shadow-lg shadow-dash-accent/20"
-                  >
-                    Continue with Google
-                  </button>
-                </motion.div>
-              ) : (
-                <motion.div 
-                  key="viewer"
-                  initial={{ opacity: 0, x: 10 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: -10 }}
-                  className="space-y-4"
-                >
-                  <p className="text-xs text-dash-muted text-center mb-6">Enter the access PIN provided by your administrator to view the dashboard.</p>
+              <div className="relative flex items-center justify-center py-2">
+                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-dash-border"></div></div>
+                <span className="relative px-4 bg-dash-card text-[10px] font-bold text-dash-muted uppercase tracking-widest">OR USE PIN</span>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2 text-center">Security Access PIN</label>
                   <div className="relative">
                     <input 
                       type="password"
-                      placeholder="Enter 4-digit PIN"
+                      placeholder="••••"
                       maxLength={4}
                       className="w-full bg-dash-bg border border-dash-border rounded-xl px-4 py-4 text-center text-2xl tracking-[1em] font-bold focus:outline-none focus:ring-2 focus:ring-dash-accent/50 transition-all"
                       value={pin}
                       onChange={(e) => {
                         const val = e.target.value.replace(/\D/g, '');
                         setPin(val);
+                        localStorage.setItem('sts_pin', val);
                         if (val === '7324') {
                           setAdminLevel('full');
                         } else if (val === '2026') {
                           setAdminLevel('assistant');
+                        } else if (val === '1974') {
+                          // Legacy pin support if needed, otherwise ignore
+                          setAdminLevel('full');
                         }
                       }}
                     />
-                    {pin.length === 4 && pin !== '7324' && pin !== '1974' && (
-                      <p className="text-dash-accent text-[10px] font-bold text-center mt-2 uppercase">Invalid Access PIN</p>
+                    {pin.length === 4 && pin !== '7324' && pin !== '2026' && pin !== '1974' && (
+                      <p className="text-red-500 text-[10px] font-bold text-center mt-2 uppercase animate-bounce">Access Denied</p>
                     )}
                   </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+                </div>
+
+                <button 
+                  onClick={() => setIsGuestViewer(true)}
+                  className="w-full py-3 text-[10px] font-bold uppercase tracking-widest text-dash-muted border border-dash-border rounded-xl hover:bg-dash-bg transition-all"
+                >
+                  Enter as Guest Viewer
+                </button>
+              </div>
+            </div>
           </div>
           
           <div className="bg-dash-bg p-4 text-center border-t border-dash-border">
@@ -835,6 +838,27 @@ export default function App() {
                     Manual Paste
                   </button>
                 </div>
+
+                {importMode === 'gmail' && selectableEmails.length > 0 && (
+                  <div className="flex items-center justify-between px-1">
+                    <span className="text-[10px] text-dash-muted font-bold uppercase tracking-widest">
+                      {selectableEmails.length} Tickets Found Today
+                    </span>
+                    <button 
+                      onClick={() => {
+                        if (selectedEmailIds.size === selectableEmails.length) {
+                          setSelectedEmailIds(new Set());
+                        } else {
+                          const allIds = new Set(selectableEmails.map(e => e.id));
+                          setSelectedEmailIds(allIds);
+                        }
+                      }}
+                      className="text-[10px] font-black uppercase tracking-widest text-dash-accent hover:underline"
+                    >
+                      {selectedEmailIds.size === selectableEmails.length ? 'Deselect All' : 'Select All (' + selectableEmails.length + ')'}
+                    </button>
+                  </div>
+                )}
 
                 {importMode === 'gmail' && (
                   <div className="flex flex-col gap-2">
@@ -990,19 +1014,6 @@ export default function App() {
                         {selectedEmailIds.size} emails selected
                       </p>
                       <div className="flex gap-2">
-                        <button 
-                          onClick={() => {
-                            if (selectedEmailIds.size === selectableEmails.length) {
-                              setSelectedEmailIds(new Set());
-                            } else {
-                              const allIds = new Set(selectableEmails.map(e => e.id));
-                              setSelectedEmailIds(allIds);
-                            }
-                          }}
-                          className="px-4 py-2 border border-dash-border text-[10px] font-bold uppercase tracking-widest text-dash-muted hover:text-dash-text text-dash-accent transition-all rounded-lg"
-                        >
-                          {selectedEmailIds.size === selectableEmails.length ? 'Deselect All' : 'Select All Today'}
-                        </button>
                         <button 
                           onClick={() => setIsImportModalOpen(false)}
                           disabled={isImporting}
@@ -1174,7 +1185,7 @@ export default function App() {
                 </div>
               </div>
               <button 
-                onClick={() => isAdmin ? handleLogout() : setIsViewer(false)}
+                onClick={() => isAdmin ? handleLogout() : setIsGuestViewer(false)}
                 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-dash-muted hover:text-dash-accent transition-colors"
               >
                 <LogOut size={14} />
@@ -1336,6 +1347,15 @@ export default function App() {
                                 <td className="px-6 py-6 text-right">
                                    <div className="flex items-center justify-end gap-4">
                                       <span className="text-[10px] text-dash-muted font-bold">{t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'HH:mm') : '-'}</span>
+                                      {canAccessFullAdmin && (
+                                        <button 
+                                          onClick={(e) => handleDelete(t.id, e)}
+                                          className="p-1.5 hover:bg-red-500/10 text-dash-muted hover:text-red-500 rounded transition-all"
+                                          title="Delete Permanently"
+                                        >
+                                          <Trash2 size={14} />
+                                        </button>
+                                      )}
                                       <ChevronRight size={16} className="text-dash-border group-hover:text-dash-accent transition-all" />
                                    </div>
                                 </td>

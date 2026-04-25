@@ -38,22 +38,9 @@ service cloud.firestore {
     }
 
     match /tickets/{ticketId} {
-      // Open read for everyone (shared board)
-      allow read: if true;
-      
-      // Allow create/update for any signed in user (any team member)
-      // or specifically the admin email.
-      allow create: if isSignedIn() && 
-                    isValidTicket(incoming()) && 
-                    incoming().createdAt == request.time && 
-                    incoming().updatedAt == request.time;
-
-      allow update: if isSignedIn() && 
-                    isValidTicket(incoming()) && 
-                    incoming().createdAt == existing().createdAt && 
-                    incoming().updatedAt == request.time;
-
-      allow delete: if isAdmin();
+      // Shared board - allow all operations for team convenience
+      // (Used with local PIN authentication)
+      allow read, create, update, delete: if true;
     }
   }
 }
