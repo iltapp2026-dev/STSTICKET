@@ -288,7 +288,9 @@ export function getStatusFromSubject(subject: string, statusRaw?: string, bodyCo
     'completed on our end', 'completed on their end', 
     'request has been completed', 'confirmed the request has been completed',
     'request has been closed', 'fix has been applied', 'issue is resolved',
-    'thank you for your help'
+    'thank you for your help', 'closed out', 'has been resolved', 'fixed',
+    'issue should be resolved', 'marked as completed', 'resolved this morning',
+    'successfully resolved', 'ticket is now closed'
   ];
 
   if (doneKeywords.some(keyword => combined.includes(keyword))) {

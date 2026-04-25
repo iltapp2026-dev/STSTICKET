@@ -108,6 +108,8 @@ export default function App() {
   const [loginMode, setLoginMode] = useState<'admin' | 'viewer'>('admin');
   const [autoSync, setAutoSync] = useState(false);
   
+  const [hideCompleted, setHideCompleted] = useState(false);
+  
   const isAdmin = !!user || adminLevel === 'full';
   const isAssistant = adminLevel === 'assistant';
   const isAuthenticated = isAdmin || isAssistant || isViewer;
@@ -200,9 +202,11 @@ export default function App() {
       }
 
       const notArchived = !t.archived;
-      return matchesSearch && matchesStatus && notArchived;
+      const hideCompletedFilter = !hideCompleted || !isResolved;
+      
+      return matchesSearch && matchesStatus && notArchived && hideCompletedFilter;
     });
-  }, [tickets, search, statusFilter]);
+  }, [tickets, search, statusFilter, hideCompleted]);
 
   useEffect(() => {
     // Background auto-corrector for statuses based on intelligence
@@ -724,9 +728,9 @@ export default function App() {
                         const val = e.target.value.replace(/\D/g, '');
                         setPin(val);
                         if (val === '7324') {
-                          setAdminLevel('assistant');
-                        } else if (val === '1974') {
                           setAdminLevel('full');
+                        } else if (val === '2026') {
+                          setAdminLevel('assistant');
                         }
                       }}
                     />
@@ -985,7 +989,20 @@ export default function App() {
                       <p className="text-xs text-dash-muted font-bold uppercase tracking-widest">
                         {selectedEmailIds.size} emails selected
                       </p>
-                      <div className="flex gap-3">
+                      <div className="flex gap-2">
+                        <button 
+                          onClick={() => {
+                            if (selectedEmailIds.size === selectableEmails.length) {
+                              setSelectedEmailIds(new Set());
+                            } else {
+                              const allIds = new Set(selectableEmails.map(e => e.id));
+                              setSelectedEmailIds(allIds);
+                            }
+                          }}
+                          className="px-4 py-2 border border-dash-border text-[10px] font-bold uppercase tracking-widest text-dash-muted hover:text-dash-text text-dash-accent transition-all rounded-lg"
+                        >
+                          {selectedEmailIds.size === selectableEmails.length ? 'Deselect All' : 'Select All Today'}
+                        </button>
                         <button 
                           onClick={() => setIsImportModalOpen(false)}
                           disabled={isImporting}
@@ -1223,6 +1240,21 @@ export default function App() {
                        Operations
                     </h1>
                     <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2 bg-dash-card border border-dash-border px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest text-dash-muted">
+                        <span>Hide Completed</span>
+                        <button 
+                          onClick={() => setHideCompleted(!hideCompleted)}
+                          className={cn(
+                            "w-6 h-3 rounded-full transition-all relative",
+                            hideCompleted ? "bg-dash-accent" : "bg-dash-border"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-0.5 w-2 h-2 bg-white rounded-full transition-all",
+                            hideCompleted ? "right-0.5" : "left-0.5"
+                          )} />
+                        </button>
+                      </div>
                       <div className="relative group w-full lg:w-72">
                         <Search size={14} className="absolute left-3 top-2.5 text-dash-muted group-focus-within:text-dash-accent transition-colors" />
                         <input 
@@ -1637,6 +1669,22 @@ export default function App() {
                       className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all"
                     >
                       Commit Record Changes
+                    </button>
+                  )}
+
+                  {editingTicket && canAccessFullAdmin && (
+                    <button 
+                      type="button"
+                      onClick={async () => {
+                        if (confirm('Permanently delete this ticket record?')) {
+                          await deleteDoc(doc(db, 'tickets', editingTicket.id));
+                          setIsAddOpen(false);
+                        }
+                      }}
+                      className="w-full bg-red-600/10 border border-red-500/20 text-red-500 py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all flex items-center justify-center gap-2"
+                    >
+                      <Trash2 size={14} />
+                      Delete Ticket Permanently
                     </button>
                   )}
 
