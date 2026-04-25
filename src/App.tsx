@@ -13,6 +13,7 @@ import {
   CheckCircle2, 
   Clock, 
   Calendar, 
+  Activity,
   AlertCircle, 
   X, 
   LayoutDashboard,
@@ -51,9 +52,11 @@ import {
   logout, 
   getStatusFromSubject, 
   parseEmailHTML,
+  softDeleteTickets,
   Ticket, 
   db,
-  auth
+  auth,
+  arrayUnion
 } from './lib/firebase';
 import { collection, addDoc, updateDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
 import { clsx, type ClassValue } from 'clsx';
@@ -66,7 +69,8 @@ function cn(...inputs: ClassValue[]) {
 function StatusBadge({ status }: { status: string }) {
   const s = status.toLowerCase();
   const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
-  const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
+  const isVisit = s.includes('visit') || s.includes('scheduled');
+  const isWaitingForPart = (s.includes('waiting') && s.includes('part')) || s.includes('procurement');
   
   let bgColor = 'bg-red-500';
   let textColor = 'text-white';
@@ -77,11 +81,15 @@ function StatusBadge({ status }: { status: string }) {
     bgColor = 'bg-emerald-500';
     borderColor = 'border-emerald-400';
     animateClass = ''; 
-  } else if (isInProgress) {
-    bgColor = 'bg-amber-400';
-    textColor = 'text-amber-950';
-    borderColor = 'border-amber-300';
-    animateClass = 'ring-2 ring-amber-400/30'; // subtle ring, no pulse
+  } else if (isVisit) {
+    bgColor = 'bg-blue-500';
+    textColor = 'text-white';
+    borderColor = 'border-blue-400';
+    animateClass = 'ring-2 ring-blue-500/30 font-black'; // subtle ring, no pulse
+  } else if (isWaitingForPart) {
+    bgColor = 'bg-amber-500';
+    borderColor = 'border-amber-400';
+    animateClass = 'ring-2 ring-amber-500/30';
   }
 
   return (
@@ -104,6 +112,8 @@ export default function App() {
   const { user, loading: authLoading } = useAuth();
   const [isGuestViewer, setIsGuestViewer] = useState(false);
   const [pin, setPin] = useState(() => localStorage.getItem('sts_pin') || '');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [adminLevel, setAdminLevel] = useState<'assistant' | 'full' | null>(() => {
     const saved = localStorage.getItem('sts_admin_level');
     return (saved === 'assistant' || saved === 'full') ? saved : null;
@@ -115,9 +125,10 @@ export default function App() {
   
   const isAdmin = !!user || adminLevel === 'full';
   const isAssistant = adminLevel === 'assistant';
-  const isViewer = !!localStorage.getItem('sts_viewer') || isGuestViewer || isAdmin || isAssistant;
-  const isAuthenticated = isAdmin || isAssistant || isViewer;
-  const canAccessFullAdmin = adminLevel === 'full' || (user?.email === 'iltapp2026@gmail.com');
+  const isViewer = (!!localStorage.getItem('sts_viewer') || isGuestViewer) && !isAdmin && !isAssistant;
+  const isAuthenticated = isAdmin || isAssistant || isViewer || !!localStorage.getItem('sts_viewer') || isGuestViewer;
+  const isOwnerEmail = user?.email === 'iltapp2026@gmail.com';
+  const canAccessFullAdmin = adminLevel === 'full' || isOwnerEmail;
   const canAccessAdmin = isAdmin || isAssistant;
 
   useEffect(() => {
@@ -135,7 +146,7 @@ export default function App() {
   // Actually, the previous implementation used user.uid. 
   // Let's use 'ALL' for viewer and maybe also for admin if it's meant to be a team dashboard.
   // Given "support@splendidtechnology.com" and "my team", shared is better.
-  const activeUserId = isAdmin ? 'ALL' : (isViewer ? 'ALL' : null);
+  const activeUserId = (isAdmin || isAssistant || isViewer) ? 'ALL' : null;
   
   const { tickets, loading: ticketsLoading } = useTickets(activeUserId);
   const [search, setSearch] = useState('');
@@ -144,6 +155,20 @@ export default function App() {
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
   const [weekOffset, setWeekOffset] = useState(0);
+  const [showHistory, setShowHistory] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
+  const [isConfirmingClear, setIsConfirmingClear] = useState(false);
+
+  // Filtered sets for clearing/display
+  const activeTickets = useMemo(() => {
+    return tickets.filter(t => !t.deletedAt);
+  }, [tickets]);
+
+  const historyTickets = useMemo(() => {
+    return tickets.filter(t => !!t.deletedAt);
+  }, [tickets]);
+
+  const currentTickets = useMemo(() => showHistory ? historyTickets : activeTickets, [activeTickets, historyTickets, showHistory]);
 
   // Import related state
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -166,29 +191,36 @@ export default function App() {
 
 
   const activityGroups = useMemo(() => {
-    const today = startOfDay(new Date());
-    const weekTickets = tickets.filter(t => {
+    const weekTickets = currentTickets.filter(t => {
+      if (t.archived) return false;
       const date = t.updatedAt?.toDate ? t.updatedAt.toDate() : new Date();
       return isWithinInterval(date, selectedWeek);
     });
 
     return {
-      completed: weekTickets.filter(t => t.status.toLowerCase().includes('done') || t.status.toLowerCase().includes('complete')),
-      scheduled: tickets.filter(t => {
-        const d = t.visitDate ? new Date(t.visitDate) : null;
-        return (t.status.toLowerCase().includes('visit') || t.status.toLowerCase().includes('scheduled')) && 
-               d && 
-               (isSameDay(d, today) || d > today) &&
-               isWithinInterval(d, selectedWeek);
+      completed: weekTickets.filter(t => {
+        const s = t.status.toLowerCase();
+        return s.includes('done') || s.includes('complete') || s.includes('resolved') || s.includes('solved') || s.includes('closed');
       }),
-      waiting: weekTickets.filter(t => !t.status.toLowerCase().includes('done')),
+      scheduled: currentTickets.filter(t => {
+        if (t.archived) return false;
+        const s = t.status.toLowerCase();
+        return (s.includes('visit') || s.includes('scheduled')) && !s.includes('done') && !s.includes('complete');
+      }),
+      waiting: currentTickets.filter(t => {
+        if (t.archived) return false;
+        const s = t.status.toLowerCase();
+        const isResolved = s.includes('done') || s.includes('complete') || s.includes('resolved') || s.includes('solved') || s.includes('closed');
+        const isVisit = s.includes('visit') || s.includes('scheduled');
+        return !isResolved && !isVisit;
+      }),
       updated: weekTickets.sort((a, b) => {
         const da = a.updatedAt?.toDate ? a.updatedAt.toDate().getTime() : 0;
         const db = b.updatedAt?.toDate ? b.updatedAt.toDate().getTime() : 0;
         return db - da;
       }).slice(0, 10)
     };
-  }, [tickets, selectedWeek]);
+  }, [currentTickets, selectedWeek]);
 
   // Form state
   const [ticketNumber, setTicketNumber] = useState('');
@@ -198,29 +230,26 @@ export default function App() {
   const [address, setAddress] = useState('');
 
   const filteredTickets = useMemo(() => {
-    return tickets.filter(t => {
+    return currentTickets.filter(t => {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       
-      const s = t.status.toLowerCase();
-      const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
-      const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
-      const isOpen = !isResolved && !isInProgress;
+      const intelligentStatus = getStatusFromSubject(t.subject, t.status, t.content || t.brief).toLowerCase();
+      const isResolved = intelligentStatus === 'done' || intelligentStatus.includes('complete') || intelligentStatus.includes('resolved') || intelligentStatus.includes('closed') || intelligentStatus.includes('solved');
+      const isVisit = intelligentStatus.includes('visit') || intelligentStatus.includes('scheduled');
+      const isOpen = !isResolved && !isVisit;
 
       let matchesStatus = statusFilter === 'All';
       if (statusFilter === 'Resolved') matchesStatus = isResolved;
-      if (statusFilter === 'In Progress') matchesStatus = isInProgress;
+      if (statusFilter === 'In Progress') matchesStatus = isVisit; // Map "Visit Scheduled" to the middle filter
       if (statusFilter === 'Open') matchesStatus = isOpen;
-      if (statusFilter !== 'All' && statusFilter !== 'Resolved' && statusFilter !== 'In Progress' && statusFilter !== 'Open') {
-        matchesStatus = t.status === statusFilter;
-      }
-
+      
       const notArchived = !t.archived;
       const hideCompletedFilter = !hideCompleted || !isResolved;
       
       return matchesSearch && matchesStatus && notArchived && hideCompletedFilter;
     });
-  }, [tickets, search, statusFilter, hideCompleted]);
+  }, [currentTickets, search, statusFilter, hideCompleted]);
 
   useEffect(() => {
     // Background auto-corrector for statuses based on intelligence
@@ -243,48 +272,109 @@ export default function App() {
 
   const stats = useMemo(() => {
     const counts = { total: 0, open: 0, progress: 0, done: 0 };
-    tickets.forEach(t => {
+    currentTickets.forEach(t => {
       if (t.archived) return;
       counts.total++;
-      const s = t.status.toLowerCase();
-      const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
-      const isInProgress = s === 'in progress' || s.includes('transit') || s.includes('waiting for part') || s.includes('visit') || s.includes('scheduled');
+      
+      const displayStatus = getStatusFromSubject(t.subject, t.status, t.content || t.brief).toLowerCase();
+      const isResolved = displayStatus === 'done' || displayStatus.includes('complete') || displayStatus.includes('resolved') || displayStatus.includes('closed') || displayStatus.includes('solved');
+      const isVisit = displayStatus.includes('visit') || displayStatus.includes('scheduled');
       
       if (isResolved) counts.done++;
-      else if (isInProgress) counts.progress++;
+      else if (isVisit) counts.progress++; // Reuse 'progress' for Visit Scheduled label
       else counts.open++;
     });
     return counts;
-  }, [tickets]);
+  }, [currentTickets]);
 
   const upcomingVisits = useMemo(() => {
     const today = startOfDay(new Date());
-    return tickets
+    return currentTickets
       .filter(t => (t.status.toLowerCase().includes('visit') || t.status.toLowerCase().includes('scheduled')) && t.visitDate)
       .filter(t => {
         const d = new Date(t.visitDate!);
         return !isNaN(d.getTime()) && (isSameDay(d, today) || d > today);
       })
       .sort((a, b) => new Date(a.visitDate!).getTime() - new Date(b.visitDate!).getTime());
-  }, [tickets]);
+  }, [currentTickets]);
 
   const isShowBanner = useMemo(() => {
     const now = new Date();
     return isThursday(now) && isBefore(now, setMinutes(setHours(now, 10), 0));
   }, []);
 
+  const handleClearActivity = async () => {
+    if (activeTickets.length === 0) return;
+    
+    const count = activeTickets.length;
+    
+    try {
+      setIsSaving(true);
+      const allIds = activeTickets.map(t => t.id);
+      const chunkSize = 200;
+      
+      for (let i = 0; i < allIds.length; i += chunkSize) {
+        const batch = writeBatch(db);
+        allIds.slice(i, i + chunkSize).forEach(id => {
+          batch.update(doc(db, 'tickets', id), {
+            deletedAt: serverTimestamp(),
+            archived: true,
+            updatedAt: serverTimestamp()
+          });
+        });
+        await batch.commit();
+      }
+      
+      setImportStatus(`Successfully archived ${count} items.`);
+      setTimeout(() => setImportStatus(null), 3000);
+      setIsConfirmingClear(false);
+    } catch (err) {
+      console.error("Archive failed:", err);
+      // Fallback for fatal error, though we try to avoid alerts
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleHardDeleteAll = async () => {
+    if (historyTickets.length === 0) return;
+    if (!window.confirm(`PERMANENTLY delete all ${historyTickets.length} archived records? This cannot be undone.`)) return;
+
+    try {
+      setIsSaving(true);
+      const allIds = historyTickets.map(t => t.id);
+      const chunkSize = 200;
+      
+      for (let i = 0; i < allIds.length; i += chunkSize) {
+        const batch = writeBatch(db);
+        allIds.slice(i, i + chunkSize).forEach(id => {
+          batch.delete(doc(db, 'tickets', id));
+        });
+        await batch.commit();
+      }
+      
+      setImportStatus(`Successfully wiped all archived records.`);
+      setTimeout(() => setImportStatus(null), 3000);
+    } catch (err) {
+      console.error("Wipe failed:", err);
+      alert("Wipe failed. Please try again.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleSaveTicket = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !editingTicket) return;
+    if (!canAccessAdmin || !editingTicket) return;
 
     const data = {
       ticketNumber,
       subject,
-      status: getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief),
+      status: getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || '')),
       visitDate: visitDate || null,
       contactName: contactName || null,
       address: address || null,
-      userId: user.uid,
+      userId: user?.uid || 'admin_pin',
       updatedAt: serverTimestamp(),
     };
 
@@ -304,8 +394,13 @@ export default function App() {
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (confirm('Are you sure you want to delete this ticket?')) {
-      await deleteDoc(doc(db, 'tickets', id));
+    if (window.confirm('PERMANENTLY delete this record? This cannot be undone.')) {
+      try {
+        await deleteDoc(doc(db, 'tickets', id));
+      } catch (err: any) {
+        console.error("Delete failed:", err);
+        alert(`Delete failed: ${err.message}`);
+      }
     }
   };
 
@@ -346,39 +441,47 @@ export default function App() {
 
   const [importQuery, setImportQuery] = useState('Splendid OR Ticket OR jseefenkhalil');
 
-  const fetchEmailsForImport = async (queryOverride?: string) => {
+  const fetchEmailsForImport = async (queryOverride?: string, isSilent = false) => {
     if (isFetchingEmails) return;
     
-    // Explicit check for viewers
-    if (isViewer && !user) {
-      setImportStatus('Viewer mode cannot access Gmail. Please login as Admin.');
-      setIsImportModalOpen(true);
-      setImportMode('manual');
+    // Check if they are authorized to manage tickets
+    if (!canAccessAdmin) {
+      if (!isSilent) {
+        setImportStatus('Access Denied. Only Admins can import tickets.');
+        setIsImportModalOpen(true);
+        setImportMode('manual');
+      }
       return;
     }
 
-    setIsFetchingEmails(true);
-    setImportStatus('Authenticating...');
-    setIsImportModalOpen(true);
-    setImportMode('gmail');
-    setSelectableEmails([]);
-    setSelectedEmailIds(new Set());
+    if (!isSilent) {
+      setIsFetchingEmails(true);
+      setImportStatus('Authenticating...');
+      setIsImportModalOpen(true);
+      setImportMode('gmail');
+      setSelectableEmails([]);
+      setSelectedEmailIds(new Set());
+    }
     
     try {
       const accessToken = await getGmailToken();
       if (!accessToken) {
-        setImportStatus('Please authorize Gmail access to continue.');
+        if (!isSilent) setImportStatus('Please authorize Gmail access to continue.');
         setIsFetchingEmails(false);
         return;
       }
       
       const today = new Date();
-      const afterDate = format(today, 'yyyy/MM/dd');
+      // Searching from start of yesterday UTC to be safe with timezones
+      const searchDate = new Date(today);
+      searchDate.setDate(today.getDate() - 1);
+      const afterDate = format(searchDate, 'yyyy/MM/dd');
+      
       const query = (typeof queryOverride === 'string') ? queryOverride : importQuery;
-      // Filter for tickets received today
+      // Search for messages since yesterday UTC
       const finalQuery = `${query} after:${afterDate}`;
       
-      setImportStatus(`Searching today's emails: ${finalQuery}...`);
+      if (!isSilent) setImportStatus(`Searching Gmail since ${afterDate}...`);
       
       const searchRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(finalQuery)}&maxResults=50`, {
         headers: { Authorization: `Bearer ${accessToken}` }
@@ -392,16 +495,22 @@ export default function App() {
       const searchData = await searchRes.json();
 
       if (!searchData.messages || searchData.messages.length === 0) {
-        setImportStatus(`No new tickets found for ${afterDate}.`);
+        if (!isSilent) setImportStatus(`No un-imported tickets found since ${afterDate}.`);
         setIsFetchingEmails(false);
         return;
       }
 
-      const emailDetails = [];
-      const existingTicketNumbers = new Set(tickets.map(t => t.ticketNumber));
+      const emailDetails: { id: string, subject: string, snippet: string, date: Date, ticketNumber: string | null }[] = [];
+      const allProcessedIds = new Set<string>();
+      tickets.forEach(t => {
+        if (t.processedMessageIds) t.processedMessageIds.forEach(id => allProcessedIds.add(id));
+      });
 
       for (const msg of searchData.messages) {
-        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=minimal`, {
+        if (allProcessedIds.has(msg.id)) continue; // Skip if this specific email was already processed
+
+        // Fetch full message to be able to search more content if snippet fails
+        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`, {
           headers: { Authorization: `Bearer ${accessToken}` }
         });
         
@@ -416,13 +525,27 @@ export default function App() {
         const subject = headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || 'No Subject';
         const date = headers.find((h: any) => h.name.toLowerCase() === 'date')?.value || '';
 
-        // Check for duplicates by ticket number in subject or snippet
-        const ticketMatch = subject.match(/Ticket#(\d+)/i) || detailData.snippet.match(/Ticket#\s*(\d+)/i);
-        const ticketNum = ticketMatch ? ticketMatch[1] : null;
-
-        if (ticketNum && existingTicketNumbers.has(ticketNum)) {
-          continue; // Skip already imported
+        // Extract more content to find ticket number if not in snippet
+        let bodyToSearch = (detailData.snippet || '') + ' ' + subject;
+        if (detailData.payload?.parts) {
+          const findTextParts = (parts: any[]): string => {
+            let text = '';
+            for (const p of parts) {
+              if (p.mimeType === 'text/plain' && p.body?.data) {
+                try {
+                  text += atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+                } catch(e) {}
+              } else if (p.parts) {
+                text += findTextParts(p.parts);
+              }
+            }
+            return text;
+          };
+          bodyToSearch += ' ' + findTextParts(detailData.payload.parts);
         }
+
+        const ticketMatch = bodyToSearch.match(/Ticket#\s*(\d+)/i) || bodyToSearch.match(/Ticket\s*#\s*:?\s*(\d+)/i);
+        const ticketNum = ticketMatch ? ticketMatch[1] : null;
 
         emailDetails.push({
           id: msg.id,
@@ -434,18 +557,38 @@ export default function App() {
       }
 
       if (emailDetails.length === 0) {
-        setImportStatus("All found tickets for today are already imported.");
+        if (!isSilent) setImportStatus("All found tickets for today are already imported.");
       } else {
         setSelectableEmails(emailDetails.sort((a, b) => b.date.getTime() - a.date.getTime()));
-        setImportStatus(null);
+        
+        // If SILENT and we found new ones, auto-import them!
+        if (isSilent && autoSync) {
+          const ids = new Set(emailDetails.map(e => e.id));
+          autoImportEmails(Array.from(ids));
+        }
+        
+        if (!isSilent) setImportStatus(null);
       }
     } catch (error: any) {
       console.error(error);
-      setImportStatus(error.message || 'Error fetching emails.');
+      if (!isSilent) setImportStatus(error.message || 'Error fetching emails.');
     } finally {
       setIsFetchingEmails(false);
     }
   };
+
+  useEffect(() => {
+    if (!autoSync || !canAccessAdmin) return;
+    
+    // Initial fetch
+    fetchEmailsForImport(undefined, true);
+    
+    const interval = setInterval(() => {
+      fetchEmailsForImport(undefined, true);
+    }, 60000); // Pulse every 60 seconds
+    
+    return () => clearInterval(interval);
+  }, [autoSync, canAccessAdmin, tickets.length]);
 
   const importManualContent = async () => {
     if (!manualContent.trim() || isImporting) return;
@@ -455,12 +598,12 @@ export default function App() {
     try {
       const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent } = parseEmailHTML(manualContent, '');
       
-      const ticketNumber = manualTicketNumber.trim() || parsedNumber;
+      const ticketNumber = (manualTicketNumber.trim() || parsedNumber).trim();
 
       if (ticketNumber && (subject || manualContent.length > 50)) {
-          const ticketSub = subject || "Manual Import - " + ticketNumber;
-        const normalizedNumber = ticketNumber.trim();
-        const existing = tickets.find(t => t.ticketNumber === normalizedNumber);
+        const ticketSub = subject || "Manual Import - " + ticketNumber;
+        const existing = tickets.find(t => t.ticketNumber === ticketNumber);
+        const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
         
         if (!existing) {
           if (!user && !adminLevel) {
@@ -468,9 +611,8 @@ export default function App() {
             setIsImporting(false);
             return;
           }
-          const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
           await addDoc(collection(db, 'tickets'), {
-            ticketNumber: normalizedNumber,
+            ticketNumber,
             subject: ticketSub,
             status: finalStatus,
             brief: brief || '',
@@ -487,7 +629,19 @@ export default function App() {
           });
           setImportStatus('Ticket imported successfully!');
         } else {
-          setImportStatus(`Ticket #${normalizedNumber} already exists. Record preserved.`);
+          // Update existing
+          await updateDoc(doc(db, 'tickets', existing.id), {
+            status: finalStatus,
+            subject: ticketSub || existing.subject,
+            brief: brief || existing.brief || '',
+            content: (existing.content ? existing.content + '\n\n' : '') + (content || ''),
+            visitDate: vDate || existing.visitDate,
+            contactName: cName || existing.contactName,
+            address: addr || existing.address,
+            updatedAt: serverTimestamp(),
+            notes: (existing.notes ? existing.notes + '\n' : '') + `Manually updated at ${new Date().toLocaleString()}`
+          });
+          setImportStatus(`Ticket #${ticketNumber} updated successfully!`);
         }
       } else {
         setImportStatus('Could not find ticket number. Please enter it manually below.');
@@ -509,6 +663,136 @@ export default function App() {
     }
   };
 
+  const autoImportEmails = async (msgIds: string[]) => {
+    if (msgIds.length === 0) return;
+    try {
+      const accessToken = await getGmailToken();
+      if (!accessToken) return;
+      await processAndImportEmails(msgIds, accessToken, true);
+    } catch (error) {
+      console.error("Auto-import error:", error);
+    }
+  };
+
+  const processAndImportEmails = async (msgIds: string[], accessToken: string, isSilentCall = false) => {
+    let importedCount = 0;
+    
+    for (let i = 0; i < msgIds.length; i++) {
+      const msgId = msgIds[i];
+      if (!isSilentCall) setImportStatus(`Processing email ${i + 1}/${msgIds.length}...`);
+      
+      const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const detailData = await detailRes.json();
+      if (!detailData.payload) continue;
+
+      const headers = detailData.payload.headers;
+      const outerSubject = headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || '';
+
+      let htmlContent = '';
+      let innerSubject = outerSubject;
+
+      const findAttachmentParts = (parts: any[]): any[] => {
+        let results: any[] = [];
+        for (const p of parts) {
+          const isEml = p.filename && p.filename.toLowerCase().includes('ticket');
+          const isRfc = p.mimeType === 'message/rfc822';
+          const hasId = p.body && p.body.attachmentId;
+          
+          if (isEml || isRfc || hasId) results.push(p);
+          if (p.parts) results = results.concat(findAttachmentParts(p.parts));
+        }
+        return results;
+      };
+
+      const attachments = findAttachmentParts(detailData.payload.parts || [detailData.payload]);
+      
+      if (attachments.length === 0) {
+         const getBody = (parts: any[]): string => {
+           for (const p of parts) {
+             if (p.mimeType === 'text/html' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+             if (p.parts) {
+               const b = getBody(p.parts);
+               if (b) return b;
+             }
+           }
+           return '';
+         };
+         htmlContent = getBody(detailData.payload.parts || [detailData.payload]);
+      }
+
+      for (const emlPart of attachments) {
+        if (emlPart.body.attachmentId) {
+          const attachRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/attachments/${emlPart.body.attachmentId}`, {
+            headers: { Authorization: `Bearer ${accessToken}` }
+          });
+          const attachData = await attachRes.json();
+          
+          if (attachData.data) {
+            const rawEml = atob(attachData.data.replace(/-/g, '+').replace(/_/g, '/'));
+            const emlSubMatch = rawEml.match(/^Subject:\s*(.*)/mi);
+            if (emlSubMatch) innerSubject = emlSubMatch[1].trim();
+
+            const htmlMatch = rawEml.match(/<html[\s\S]*?<\/html>/i);
+            if (htmlMatch) {
+              htmlContent = htmlMatch[0];
+            } else {
+              const parts = rawEml.split(/Content-Type:\s*text\/html/i);
+              if (parts.length > 1) {
+                const afterHtmlHeader = parts[1];
+                const boundaryMatch = afterHtmlHeader.match(/--[\w-]+/);
+                htmlContent = boundaryMatch ? afterHtmlHeader.split(boundaryMatch[0])[0] : afterHtmlHeader;
+              }
+            }
+          }
+        }
+      }
+
+      if (htmlContent) {
+        const { ticketNumber: rawNum, subject: parsedSubject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent, innerSubject);
+        const ticketNumber = (rawNum || '').trim();
+        
+        if (ticketNumber && parsedSubject) {
+          const existing = tickets.find(t => t.ticketNumber === ticketNumber);
+          const finalStatus = getStatusFromSubject(parsedSubject, rawStatus, content || brief);
+          
+          if (!existing) {
+            await addDoc(collection(db, 'tickets'), {
+              ticketNumber,
+              subject: parsedSubject,
+              status: finalStatus,
+              brief: brief || '',
+              content: content || '',
+              htmlContent: extractedHtml || '',
+              visitDate: vDate || null,
+              contactName: cName || '',
+              address: addr || '',
+              userId: user?.uid || adminLevel || 'SYSTEM',
+              processedMessageIds: [msgId],
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            importedCount++;
+          } else {
+            // Update existing ticket
+            await updateDoc(doc(db, 'tickets', existing.id), {
+              status: finalStatus,
+              brief: brief || existing.brief || '',
+              content: (existing.content ? existing.content + '\n\n' : '') + (content || ''),
+              htmlContent: extractedHtml || existing.htmlContent || '',
+              visitDate: vDate || existing.visitDate,
+              processedMessageIds: arrayUnion(msgId),
+              updatedAt: serverTimestamp(),
+            });
+            importedCount++;
+          }
+        }
+      }
+    }
+    return importedCount;
+  };
+
   const importSelectedEmails = async () => {
     if (isImporting || selectedEmailIds.size === 0) return;
     setIsImporting(true);
@@ -518,114 +802,10 @@ export default function App() {
       const accessToken = await getGmailToken();
       if (!accessToken) return;
 
-      let newCount = 0;
-      const idsToProcess = Array.from(selectedEmailIds);
+      const idsToProcess = [...selectedEmailIds];
+      const newCount = await processAndImportEmails(idsToProcess, accessToken);
 
-      for (let i = 0; i < idsToProcess.length; i++) {
-        const msgId = idsToProcess[i];
-        setImportStatus(`Processing email ${i + 1}/${idsToProcess.length}...`);
-        
-        const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}`, {
-          headers: { Authorization: `Bearer ${accessToken}` }
-        });
-        const detailData = await detailRes.json();
-
-        const headers = detailData.payload.headers;
-        const outerSubject = headers.find((h: any) => h.name.toLowerCase() === 'subject')?.value || '';
-
-        let htmlContent = '';
-        let innerSubject = outerSubject;
-
-        const findAttachmentParts = (parts: any[]): any[] => {
-          let results: any[] = [];
-          for (const p of parts) {
-            const isEml = p.filename && p.filename.toLowerCase().includes('ticket');
-            const isRfc = p.mimeType === 'message/rfc822';
-            const hasId = p.body && p.body.attachmentId;
-            
-            if (isEml || isRfc || hasId) results.push(p);
-            if (p.parts) results = results.concat(findAttachmentParts(p.parts));
-          }
-          return results;
-        };
-
-        const attachments = findAttachmentParts(detailData.payload.parts || [detailData.payload]);
-        
-        if (attachments.length === 0) {
-           const getBody = (parts: any[]): string => {
-             for (const p of parts) {
-               if (p.mimeType === 'text/html' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
-               if (p.parts) {
-                 const b = getBody(p.parts);
-                 if (b) return b;
-               }
-             }
-             return '';
-           };
-           htmlContent = getBody(detailData.payload.parts || [detailData.payload]);
-        }
-
-        for (const emlPart of attachments) {
-          if (emlPart.body.attachmentId) {
-            const attachRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/attachments/${emlPart.body.attachmentId}`, {
-              headers: { Authorization: `Bearer ${accessToken}` }
-            });
-            const attachData = await attachRes.json();
-            
-            if (attachData.data) {
-              const rawEml = atob(attachData.data.replace(/-/g, '+').replace(/_/g, '/'));
-              const emlSubMatch = rawEml.match(/^Subject:\s*(.*)/mi);
-              if (emlSubMatch) innerSubject = emlSubMatch[1].trim();
-
-              const htmlMatch = rawEml.match(/<html[\s\S]*?<\/html>/i);
-              if (htmlMatch) {
-                htmlContent = htmlMatch[0];
-              } else {
-                const parts = rawEml.split(/Content-Type:\s*text\/html/i);
-                if (parts.length > 1) {
-                  const afterHtmlHeader = parts[1];
-                  const boundaryMatch = afterHtmlHeader.match(/--[\w-]+/);
-                  htmlContent = boundaryMatch ? afterHtmlHeader.split(boundaryMatch[0])[0] : afterHtmlHeader;
-                }
-              }
-            }
-          }
-        }
-
-        if (htmlContent) {
-          const { ticketNumber: rawNum, subject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent, innerSubject);
-          const ticketNumber = rawNum.trim();
-          
-          if (ticketNumber && subject) {
-            const existing = tickets.find(t => t.ticketNumber === ticketNumber);
-            if (!existing) {
-              if (!user && !adminLevel) {
-                setImportStatus('Auth session expired. Please refresh.');
-                setIsImporting(false);
-                return;
-              }
-              const finalStatus = getStatusFromSubject(subject, rawStatus, content || brief);
-              await addDoc(collection(db, 'tickets'), {
-                ticketNumber,
-                subject,
-                status: finalStatus,
-                brief: brief || '',
-                content: content || '',
-                htmlContent: extractedHtml || '',
-                visitDate: vDate || null,
-                contactName: cName || '',
-                address: addr || '',
-                userId: user?.uid || adminLevel || 'SYSTEM',
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-              newCount++;
-            }
-          }
-        }
-      }
-
-      setImportStatus(`Success! Imported ${newCount} tickets.`);
+      setImportStatus(`Success! Processed ${newCount} updates.`);
       setTimeout(() => {
         setImportStatus(null);
         setIsImportModalOpen(false);
@@ -662,6 +842,8 @@ export default function App() {
     setContactName(ticket.contactName || '');
     setAddress(ticket.address || '');
     setIsAddOpen(true);
+    setIsDeleting(false);
+    setIsSaving(false);
   };
 
   if (authLoading) {
@@ -842,21 +1024,8 @@ export default function App() {
                 {importMode === 'gmail' && selectableEmails.length > 0 && (
                   <div className="flex items-center justify-between px-1">
                     <span className="text-[10px] text-dash-muted font-bold uppercase tracking-widest">
-                      {selectableEmails.length} Tickets Found Today
+                      {selectableEmails.length} New Tickets Detected
                     </span>
-                    <button 
-                      onClick={() => {
-                        if (selectedEmailIds.size === selectableEmails.length) {
-                          setSelectedEmailIds(new Set());
-                        } else {
-                          const allIds = new Set(selectableEmails.map(e => e.id));
-                          setSelectedEmailIds(allIds);
-                        }
-                      }}
-                      className="text-[10px] font-black uppercase tracking-widest text-dash-accent hover:underline"
-                    >
-                      {selectedEmailIds.size === selectableEmails.length ? 'Deselect All' : 'Select All (' + selectableEmails.length + ')'}
-                    </button>
                   </div>
                 )}
 
@@ -886,7 +1055,7 @@ export default function App() {
                         onClick={() => fetchEmailsForImport()}
                         className="px-4 bg-dash-accent text-white rounded-lg text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/10"
                       >
-                        Search Today
+                        Sync Gmail
                       </button>
                     </div>
                     {importStatus && (
@@ -919,15 +1088,15 @@ export default function App() {
                     ) : selectableEmails.length === 0 ? (
                       <div className="py-20 text-center">
                         <Mail className="w-12 h-12 text-dash-border mx-auto mb-4" />
-                        <p className="text-sm text-dash-muted italic">Ready to sync with Gmail.</p>
+                        <p className="text-sm text-dash-muted italic">No recent un-imported tickets found.</p>
                         <p className="text-[10px] text-dash-muted uppercase font-bold tracking-widest mt-4 mb-6">
-                           We search for Splendid ticket emails sent to your inbox.
+                           Scanning Splendid ticket notifications from the last 3 days.
                         </p>
                         <button 
                           onClick={() => fetchEmailsForImport()}
                           className="px-8 py-3 bg-dash-bg border border-dash-border rounded-xl text-xs font-bold uppercase tracking-widest hover:border-dash-accent hover:text-dash-accent transition-all"
                         >
-                          Connect & Search Inbox
+                          Check Again
                         </button>
                       </div>
                     ) : (
@@ -1014,6 +1183,21 @@ export default function App() {
                         {selectedEmailIds.size} emails selected
                       </p>
                       <div className="flex gap-2">
+                        {importMode === 'gmail' && selectableEmails.length > 0 && (
+                          <button 
+                            onClick={() => {
+                              if (selectedEmailIds.size === selectableEmails.length) {
+                                setSelectedEmailIds(new Set());
+                              } else {
+                                const allIds = new Set(selectableEmails.map(e => e.id));
+                                setSelectedEmailIds(allIds);
+                              }
+                            }}
+                            className="px-6 py-2.5 bg-white border border-dash-border text-[10px] font-black uppercase tracking-widest text-dash-accent hover:bg-dash-bg transition-all rounded-xl shadow-sm"
+                          >
+                            {selectedEmailIds.size === selectableEmails.length ? 'Deselect All' : 'Select Recent'}
+                          </button>
+                        )}
                         <button 
                           onClick={() => setIsImportModalOpen(false)}
                           disabled={isImporting}
@@ -1226,31 +1410,122 @@ export default function App() {
                       onClick={() => setStatusFilter('In Progress')}
                       className={cn(
                         "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
-                        statusFilter === 'In Progress' ? "border-amber-500 ring-2 ring-amber-500/20 bg-amber-500/10" : "border-dash-border hover:border-amber-400"
+                        statusFilter === 'In Progress' ? "border-blue-500 ring-2 ring-blue-500/20 bg-blue-500/10" : "border-dash-border hover:border-blue-400"
                       )}
                     >
-                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-amber-600">In Transit</div>
-                      <div className="text-2xl font-bold text-amber-600">{stats.progress.toString().padStart(2, '0')}</div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-blue-600">Visit Scheduled</div>
+                      <div className="text-2xl font-bold text-blue-600">{stats.progress.toString().padStart(2, '0')}</div>
                     </button>
                     <button 
                       onClick={() => setStatusFilter('Resolved')}
                       className={cn(
                         "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
-                        statusFilter === 'Resolved' ? "border-green-500 ring-2 ring-green-500/20 bg-green-500/10" : "border-dash-border hover:border-green-400"
+                        statusFilter === 'Resolved' ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-500/10" : "border-dash-border hover:border-emerald-400"
                       )}
                     >
-                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-green-600">Resolved</div>
-                      <div className="text-2xl font-bold text-green-600">{stats.done.toString().padStart(2, '0')}</div>
+                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-emerald-600">Resolved</div>
+                      <div className="text-2xl font-bold text-emerald-600">{stats.done.toString().padStart(2, '0')}</div>
                     </button>
                   </div>
 
                   {/* Header/Controls */}
                   <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                    <h1 className="text-2xl font-black italic tracking-tighter uppercase flex items-center gap-2">
-                       <LayoutDashboard className="text-dash-accent" />
-                       Operations
-                    </h1>
+                    <div className="flex items-center gap-4">
+                      <h1 className="text-2xl font-black italic tracking-tighter uppercase flex items-center gap-2">
+                        <LayoutDashboard className="text-dash-accent" />
+                        Operations
+                      </h1>
+                      {canAccessAdmin && !showHistory && (
+                        <div className={cn(
+                          "flex items-center gap-3 px-4 py-2 rounded-xl border transition-all duration-300",
+                          isConfirmingClear ? "bg-red-600 border-red-700 shadow-lg" : "bg-red-500/5 border-red-500/20 shadow-sm"
+                        )}>
+                          {isConfirmingClear ? (
+                            <div className="flex items-center gap-4">
+                              <span className="text-[10px] font-black uppercase tracking-widest text-white animate-pulse">
+                                Confirm Archive {activeTickets.length}?
+                              </span>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    handleClearActivity();
+                                  }}
+                                  disabled={isSaving}
+                                  className="px-3 py-1 bg-white text-red-600 text-[10px] font-black rounded-lg hover:bg-gray-100 transition-colors uppercase tracking-widest"
+                                >
+                                  {isSaving ? "Clearing..." : "Yes, Clear"}
+                                </button>
+                                <button
+                                  onClick={() => setIsConfirmingClear(false)}
+                                  disabled={isSaving}
+                                  className="px-3 py-1 bg-red-700/50 text-white text-[10px] font-black rounded-lg hover:bg-red-700 transition-colors uppercase tracking-widest"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <span className="text-[10px] font-black uppercase tracking-tighter text-red-500">
+                                Clear Dashboard
+                              </span>
+                              <button 
+                                type="button"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  if (activeTickets.length > 0) setIsConfirmingClear(true);
+                                }}
+                                disabled={isSaving || activeTickets.length === 0}
+                                className={cn(
+                                  "w-12 h-6 rounded-full transition-all relative flex items-center p-1 cursor-pointer",
+                                  activeTickets.length > 0 ? "bg-red-500" : "bg-gray-200"
+                                )}
+                              >
+                                <div className={cn(
+                                  "h-4 w-4 bg-white rounded-full transition-all shadow-md transform",
+                                  isSaving ? "left-1/2 -translate-x-1/2 animate-pulse" : "translate-x-0"
+                                )} />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {showHistory && (
+                        <div className="flex items-center gap-3">
+                          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 text-[10px] font-black uppercase tracking-widest">
+                            <History size={12} />
+                            Archive
+                          </div>
+                          {canAccessFullAdmin && historyTickets.length > 0 && (
+                            <button
+                              onClick={handleHardDeleteAll}
+                              disabled={isSaving}
+                              className="px-3 py-1.5 bg-red-500/10 border border-red-500/20 text-red-600 text-[10px] font-black uppercase tracking-widest rounded-xl hover:bg-red-500 hover:text-white transition-all disabled:opacity-50"
+                            >
+                              Wipe Archive
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
                     <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2 bg-dash-card border border-dash-border px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest text-dash-muted">
+                        <span>View Records</span>
+                        <button 
+                          onClick={() => setShowHistory(!showHistory)}
+                          className={cn(
+                            "w-6 h-3 rounded-full transition-all relative",
+                            showHistory ? "bg-red-500" : "bg-dash-border"
+                          )}
+                        >
+                          <div className={cn(
+                            "absolute top-0.5 w-2 h-2 bg-white rounded-full transition-all",
+                            showHistory ? "right-0.5" : "left-0.5"
+                          )} />
+                        </button>
+                      </div>
                       <div className="flex items-center gap-2 bg-dash-card border border-dash-border px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest text-dash-muted">
                         <span>Hide Completed</span>
                         <button 
@@ -1342,12 +1617,12 @@ export default function App() {
                                   </div>
                                 </td>
                                 <td className="px-6 py-6">
-                                  <StatusBadge status={t.status} />
+                                  <StatusBadge status={getStatusFromSubject(t.subject, t.status, t.content || t.brief)} />
                                 </td>
                                 <td className="px-6 py-6 text-right">
                                    <div className="flex items-center justify-end gap-4">
                                       <span className="text-[10px] text-dash-muted font-bold">{t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'HH:mm') : '-'}</span>
-                                      {canAccessFullAdmin && (
+                                      {canAccessAdmin && (
                                         <button 
                                           onClick={(e) => handleDelete(t.id, e)}
                                           className="p-1.5 hover:bg-red-500/10 text-dash-muted hover:text-red-500 rounded transition-all"
@@ -1412,14 +1687,33 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <div>
                     <h2 className="text-2xl font-black tracking-tight flex items-center gap-3 uppercase italic">
-                      <CalendarCheck className="text-dash-accent" />
-                      Operational Board
+                      <Activity className="text-blue-500" />
+                      Live Activity Command
                     </h2>
                     <p className="text-dash-muted text-[10px] font-bold uppercase tracking-[0.2em] mt-1">
-                      {format(selectedWeek.start, 'MMM d')} - {format(selectedWeek.end, 'MMM d, yyyy')}
+                      Current Operational Period: {format(selectedWeek.start, 'MMM d')} - {format(selectedWeek.end, 'MMM d, yyyy')}
                     </p>
                   </div>
                   <div className="flex items-center gap-2 bg-dash-card border border-dash-border p-1 rounded-xl shadow-sm">
+                    {canAccessAdmin && activeTickets.length > 0 && !showHistory && (
+                      <button 
+                        onClick={handleClearActivity}
+                        disabled={isSaving}
+                        className="px-4 py-2 text-[10px] font-black uppercase tracking-widest bg-red-500 text-white hover:bg-red-600 rounded-lg transition-all flex items-center gap-2 border-r border-dash-border shadow-lg shadow-red-500/20"
+                      >
+                        <History size={14} />
+                        Archive Board
+                      </button>
+                    )}
+                    {showHistory && (
+                      <button 
+                        onClick={() => setShowHistory(false)}
+                        className="px-4 py-2 text-[10px] font-black uppercase tracking-widest bg-emerald-500 text-white hover:bg-emerald-600 rounded-lg transition-all flex items-center gap-2 border-r border-dash-border shadow-lg shadow-emerald-500/20"
+                      >
+                        <History size={14} />
+                        Exit Records
+                      </button>
+                    )}
                     <button onClick={() => setWeekOffset(v => v - 1)} className="p-2 hover:bg-dash-bg rounded-lg transition-all text-dash-muted">
                       <ChevronRight size={18} className="rotate-180" />
                     </button>
@@ -1432,19 +1726,19 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
                   {/* Scheduled Future */}
                   <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-dash-accent">
+                    <div className="flex items-center gap-2 text-blue-500">
                       <Calendar size={18} />
                       <h3 className="text-xs font-black uppercase tracking-widest italic">Upcoming Visits</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-accent/10 border border-dash-accent/20 rounded-full">{activityGroups.scheduled.length}</span>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-blue-500/10 border border-blue-500/20 rounded-full text-blue-600">{activityGroups.scheduled.length}</span>
                     </div>
                     <div className="space-y-4">
                       {activityGroups.scheduled.map(t => (
-                        <div key={t.id} className="bg-dash-card border border-dash-accent/20 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-dash-accent cursor-pointer group" onClick={() => openEdit(t)}>
+                        <div key={t.id} className="bg-dash-card border border-blue-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-blue-500 cursor-pointer group" onClick={() => openEdit(t)}>
                           <div className="flex justify-between items-start mb-3">
-                            <span className="text-[10px] font-mono text-dash-accent font-black uppercase">{t.visitDate}</span>
+                            <span className="text-[10px] font-mono text-blue-600 font-black uppercase">{t.visitDate || 'No date set'}</span>
                             <span className="text-[9px] font-bold text-dash-muted uppercase">#{t.ticketNumber}</span>
                           </div>
-                          <div className="font-bold text-sm leading-tight group-hover:text-dash-accent transition-colors mb-2 uppercase italic">{t.subject}</div>
+                          <div className="font-bold text-sm leading-tight group-hover:text-blue-600 transition-colors mb-2 uppercase italic">{t.subject}</div>
                           <div className="text-[10px] text-dash-muted font-medium truncate italic">{t.address || 'No location provided'}</div>
                         </div>
                       ))}
@@ -1454,18 +1748,18 @@ export default function App() {
    
                   {/* Completed */}
                   <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-dash-secondary">
+                    <div className="flex items-center gap-2 text-emerald-500">
                       <CheckCircle2 size={18} />
-                      <h3 className="text-xs font-black uppercase tracking-widest italic">Resolved</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-secondary/10 border border-dash-secondary/20 rounded-full">{activityGroups.completed.length}</span>
+                      <h3 className="text-xs font-black uppercase tracking-widest italic">Resolved Hub</h3>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-emerald-600">{activityGroups.completed.length}</span>
                     </div>
                     <div className="space-y-4">
                       {activityGroups.completed.map(t => (
-                        <div key={t.id} className="bg-dash-card border border-dash-border p-5 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
+                        <div key={t.id} className="bg-dash-card border border-emerald-500/10 p-5 rounded-2xl shadow-sm hover:shadow-md transition-all border-l-4 border-l-emerald-500 cursor-pointer group" onClick={() => openEdit(t)}>
                           <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase tracking-tighter">Reference #{t.ticketNumber}</div>
-                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-dash-secondary transition-colors italic">{t.subject}</div>
-                          <div className="flex items-center gap-2 text-dash-secondary text-[10px] font-black uppercase">
-                             <div className="w-1.5 h-1.5 rounded-full bg-dash-secondary" />
+                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-emerald-600 transition-colors italic">{t.subject}</div>
+                          <div className="flex items-center gap-2 text-emerald-600 text-[10px] font-black uppercase">
+                             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
                              Marked Complete
                           </div>
                         </div>
@@ -1476,19 +1770,19 @@ export default function App() {
    
                   {/* Waiting */}
                   <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-dash-gold">
-                      <Clock size={18} />
+                    <div className="flex items-center gap-2 text-red-500">
+                      <AlertCircle size={18} className="animate-pulse" />
                       <h3 className="text-xs font-black uppercase tracking-widest italic">Active Queue</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-dash-gold/10 border border-dash-gold/20 rounded-full">{activityGroups.waiting.length}</span>
+                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-red-500/10 border border-red-500/20 rounded-full text-red-600">{activityGroups.waiting.length}</span>
                     </div>
                     <div className="space-y-4">
                       {activityGroups.waiting.map(t => (
-                        <div key={t.id} className="bg-dash-card border border-dash-border p-5 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group" onClick={() => openEdit(t)}>
+                        <div key={t.id} className="bg-dash-card border-red-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-red-500 cursor-pointer group" onClick={() => openEdit(t)}>
                           <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase">Ticket #{t.ticketNumber}</div>
-                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-dash-gold transition-colors">{t.subject}</div>
+                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-red-600 transition-colors font-black uppercase italic">{t.subject}</div>
                           <div className="flex items-center gap-2">
-                             <div className="w-1.5 h-1.5 rounded-full bg-dash-gold animate-pulse"></div>
-                             <span className="text-[9px] text-dash-gold font-black uppercase tracking-tight">Requires Attention</span>
+                             <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.5)]"></div>
+                             <span className="text-[9px] text-red-600 font-black uppercase tracking-tight">Requires Attention</span>
                           </div>
                         </div>
                       ))}
@@ -1599,7 +1893,7 @@ export default function App() {
               <div className="space-y-6">
                 <div>
                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Live Status</label>
-                   <StatusBadge status={getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief)} />
+                   <StatusBadge status={getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || ''))} />
                 </div>
 
                 {editingTicket?.brief && (
@@ -1671,41 +1965,73 @@ export default function App() {
                 </div>
 
                 <div className="pt-10 space-y-4">
-                  {editingTicket && (
+                  {editingTicket && canAccessAdmin && (
                     <button 
                       type="button"
+                      disabled={isSaving}
                       onClick={async () => {
-                        const data = {
-                          ticketNumber,
-                          subject,
-                          status: getStatusFromSubject(subject, undefined, editingTicket?.content || editingTicket?.brief),
-                          visitDate: visitDate || null,
-                          address: address || null,
-                          updatedAt: serverTimestamp()
-                        };
-                        await updateDoc(doc(db, 'tickets', editingTicket.id), data);
-                        setIsAddOpen(false);
+                        setIsSaving(true);
+                        try {
+                          const data = {
+                            ticketNumber,
+                            subject,
+                            status: getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || '')),
+                            visitDate: visitDate || null,
+                            address: address || null,
+                            updatedAt: serverTimestamp()
+                          };
+                          await updateDoc(doc(db, 'tickets', editingTicket.id), data);
+                          setIsAddOpen(false);
+                        } catch (err: any) {
+                          console.error("Update failed:", err);
+                        } finally {
+                          setIsSaving(false);
+                        }
                       }}
-                      className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all"
+                      className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50"
                     >
-                      Commit Record Changes
+                      {isSaving ? 'Synchronizing...' : 'Commit Record Changes'}
                     </button>
                   )}
 
                   {editingTicket && canAccessFullAdmin && (
-                    <button 
-                      type="button"
-                      onClick={async () => {
-                        if (confirm('Permanently delete this ticket record?')) {
-                          await deleteDoc(doc(db, 'tickets', editingTicket.id));
-                          setIsAddOpen(false);
-                        }
-                      }}
-                      className="w-full bg-red-600/10 border border-red-500/20 text-red-500 py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all flex items-center justify-center gap-2"
-                    >
-                      <Trash2 size={14} />
-                      Delete Ticket Permanently
-                    </button>
+                    <div className="space-y-2">
+                      {isDeleting ? (
+                        <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 space-y-4">
+                          <p className="text-[10px] text-red-500 font-bold uppercase tracking-widest text-center">Confirm Permanent Deletion?</p>
+                          <div className="flex gap-2">
+                            <button 
+                              onClick={async () => {
+                                try {
+                                  await deleteDoc(doc(db, 'tickets', editingTicket.id));
+                                  setIsAddOpen(false);
+                                } catch (err: any) {
+                                  console.error(err);
+                                }
+                              }}
+                              className="flex-1 bg-red-600 text-white py-3 rounded-lg text-[10px] font-bold uppercase tracking-widest hover:bg-red-700 transition-all font-black text-center"
+                            >
+                              Destroy
+                            </button>
+                            <button 
+                              onClick={() => setIsDeleting(false)}
+                              className="flex-1 bg-dash-bg text-dash-muted py-3 rounded-lg text-[10px] font-bold uppercase tracking-widest border border-dash-border hover:text-dash-text transition-all font-black text-center"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button 
+                          type="button"
+                          onClick={() => setIsDeleting(true)}
+                          className="w-full bg-red-600/10 border border-red-500/20 text-red-500 py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all flex items-center justify-center gap-2 group outline-none"
+                        >
+                          <Trash2 size={14} className="group-hover:animate-bounce" />
+                          Delete Ticket Permanently
+                        </button>
+                      )}
+                    </div>
                   )}
 
                   {editingTicket && (getStatusFromSubject(subject).toLowerCase().includes('done') || getStatusFromSubject(subject).toLowerCase().includes('complete') || getStatusFromSubject(subject).toLowerCase().includes('resolve')) && (
@@ -1713,8 +2039,14 @@ export default function App() {
                       type="button"
                       onClick={async () => {
                         if (editingTicket) {
-                          await updateDoc(doc(db, 'tickets', editingTicket.id), { archived: true });
-                          setIsAddOpen(false);
+                          try {
+                            await updateDoc(doc(db, 'tickets', editingTicket.id), { archived: true });
+                            setIsAddOpen(false);
+                            alert("Ticket archived.");
+                          } catch (err: any) {
+                            console.error("Archive failed:", err);
+                            alert(`Archive failed: ${err.message}`);
+                          }
                         }
                       }}
                       className="w-full bg-dash-bg border border-dash-border py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:border-dash-secondary/30 transition-all flex items-center justify-center gap-2 group"
