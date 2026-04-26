@@ -49,8 +49,8 @@ import { useTickets } from './lib/hooks';
 import { 
   loginWithGoogle, 
   getGmailToken,
+  hasGmailToken,
   logout, 
-  ensureAuth,
   getStatusFromSubject, 
   parseEmailHTML,
   softDeleteTickets,
@@ -62,7 +62,15 @@ import {
   handleFirestoreError,
   OperationType
 } from './lib/firebase';
-import { collection, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, writeBatch, getDocFromServer } from 'firebase/firestore';
+import { 
+  syncTicketToSheets, 
+  deleteTicketFromSheets, 
+  fetchAllTicketsFromSheets, 
+  initializeSheet, 
+  getSpreadsheetId, 
+  setSpreadsheetId 
+} from './lib/sheets';
+import { collection, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, Timestamp, writeBatch, getDocFromServer } from 'firebase/firestore';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -185,6 +193,8 @@ export default function App() {
   
   const [hideCompleted, setHideCompleted] = useState(false);
   
+  const [localSheetId, setLocalSheetId] = useState(getSpreadsheetId());
+  
   const isAdmin = adminLevel === 'full';
   const isAssistant = false;
   const isViewer = !isAdmin;
@@ -218,7 +228,48 @@ export default function App() {
       }
     };
     testConnection();
-  }, []);
+
+    const reconcileWithSheets = async () => {
+      if (hasGmailToken()) {
+        setImportStatus('Reconciling with master sheet...');
+        try {
+          const sheetTickets = await fetchAllTicketsFromSheets();
+          const batch = writeBatch(db);
+          let changes = 0;
+
+          for (const st of sheetTickets) {
+             if (!st.id) continue;
+             const existing = tickets.find(t => t.id === st.id);
+             if (!existing || existing.status !== st.status) {
+               batch.set(doc(db, 'tickets', st.id), {
+                 id: st.id,
+                 ticketNumber: st.ticketNumber,
+                 subject: st.subject,
+                 status: st.status,
+                 visitDate: st.visitDate || null,
+                 contactName: st.contactName || '',
+                 address: st.address || '',
+                 userId: st.userId || 'system',
+                 createdAt: st.createdAt ? Timestamp.fromDate(new Date(st.createdAt)) : serverTimestamp(),
+                 updatedAt: st.updatedAt ? Timestamp.fromDate(new Date(st.updatedAt)) : serverTimestamp(),
+                 archived: st.archived === 'TRUE'
+               }, { merge: true });
+               changes++;
+             }
+          }
+          if (changes > 0) {
+            await batch.commit();
+            console.log(`Reconciled ${changes} tickets from Sheets.`);
+          }
+        } catch (e) {
+          console.error("Master Reconciliation Failed:", e);
+        } finally {
+          setImportStatus(null);
+        }
+      }
+    };
+    if (adminLevel) reconcileWithSheets();
+  }, [adminLevel]);
 
   const todayVisits = useMemo(() => {
     const today = new Date();
@@ -511,7 +562,8 @@ export default function App() {
       
       for (let i = 0; i < allIds.length; i += chunkSize) {
         const batch = writeBatch(db);
-        allIds.slice(i, i + chunkSize).forEach(id => {
+        const chunkIds = allIds.slice(i, i + chunkSize);
+        chunkIds.forEach(id => {
           batch.update(doc(db, 'tickets', id), {
             deletedAt: serverTimestamp(),
             archived: true,
@@ -519,6 +571,19 @@ export default function App() {
           });
         });
         await batch.commit();
+
+        // Sync with Sheets
+        for (const id of chunkIds) {
+          const ticket = toClear.find(t => t.id === id);
+          if (ticket) {
+            await syncTicketToSheets({ 
+              ...ticket, 
+              archived: true, 
+              deletedAt: Timestamp.now() as any, 
+              updatedAt: Timestamp.now() as any 
+            } as Ticket);
+          }
+        }
       }
       
       setImportStatus(`Successfully archived ${count} items.`);
@@ -544,10 +609,16 @@ export default function App() {
       
       for (let i = 0; i < allIds.length; i += chunkSize) {
         const batch = writeBatch(db);
-        allIds.slice(i, i + chunkSize).forEach(id => {
+        const chunkIds = allIds.slice(i, i + chunkSize);
+        chunkIds.forEach(id => {
           batch.delete(doc(db, 'tickets', id));
         });
         await batch.commit();
+
+        // Sync with Sheets
+        for (const id of chunkIds) {
+          await deleteTicketFromSheets(id);
+        }
       }
       
       setImportStatus(`Successfully wiped all archived records.`);
@@ -576,7 +647,9 @@ export default function App() {
     };
 
     try {
+      const fullTicket = { ...editingTicket, ...data } as Ticket;
       await updateDoc(doc(db, 'tickets', editingTicket.id), data);
+      await syncTicketToSheets(fullTicket);
       setIsAddOpen(false);
       setEditingId(null);
       setTicketNumber('');
@@ -657,6 +730,14 @@ export default function App() {
         setIsFetchingEmails(false);
         return;
       }
+
+      // Check master source of truth (Sheets) to skip completed tickets
+      const sheetTickets = await fetchAllTicketsFromSheets();
+      const completedSheetNums = new Set(
+        sheetTickets
+          .filter(t => t.status.toLowerCase() === 'done' || t.status.toLowerCase() === 'complete')
+          .map(t => t.ticketNumber.replace(/\D/g, ''))
+      );
       
       const today = new Date();
       // Searching from start of yesterday UTC to be safe with timezones
@@ -735,15 +816,17 @@ export default function App() {
         const ticketMatch = bodyToSearch.match(/Ticket#\s*(\d+)/i) || bodyToSearch.match(/Ticket\s*#\s*:?\s*(\d+)/i);
         const ticketNum = ticketMatch ? ticketMatch[1] : null;
 
-        // SKIP if ticket already exists and is completed
+        // SKIP if ticket already exists and is completed (checked against both Firestore AND Sheets master)
         if (ticketNum) {
           const normNum = ticketNum.replace(/\D/g, '');
-          const isCompleted = tickets.some(t => {
+          const isCompletedInFirestore = tickets.some(t => {
             const tNum = (t.ticketNumber || '').replace(/\D/g, '');
             const statusLower = (t.status || '').toLowerCase();
             return tNum === normNum && (statusLower === 'done' || statusLower === 'complete');
           });
-          if (isCompleted) {
+          const isCompletedInSheets = completedSheetNums.has(normNum);
+          
+          if (isCompletedInFirestore || isCompletedInSheets) {
             console.log(`Filtering out completed ticket #${ticketNum} from import list`);
             continue;
           }
@@ -817,7 +900,7 @@ export default function App() {
             setIsImporting(false);
             return;
           }
-          await addDoc(collection(db, 'tickets'), {
+          const docRef = await addDoc(collection(db, 'tickets'), {
             ticketNumber,
             subject: ticketSub,
             status: finalStatus,
@@ -833,10 +916,28 @@ export default function App() {
             priority: 'Medium',
             notes: `Manually imported at ${new Date().toLocaleString()}`,
           });
+          if (docRef) {
+            const newTicket = { 
+              id: docRef.id, 
+              ticketNumber, 
+              subject: ticketSub, 
+              status: finalStatus, 
+              brief: brief || '', 
+              content: content || '', 
+              htmlContent: htmlContent || '', 
+              visitDate: vDate || null, 
+              contactName: cName || '', 
+              address: addr || '', 
+              userId: adminLevel || 'SYSTEM',
+              createdAt: Timestamp.now(),
+              updatedAt: Timestamp.now()
+            } as Ticket;
+            await syncTicketToSheets(newTicket);
+          }
           setImportStatus('Ticket imported successfully!');
         } else {
           // Update existing
-          await updateDoc(doc(db, 'tickets', existing.id), {
+          const updateData = {
             status: finalStatus,
             subject: ticketSub || existing.subject,
             brief: brief || existing.brief || '',
@@ -848,7 +949,9 @@ export default function App() {
             archived: false,
             deletedAt: null,
             notes: (existing.notes ? existing.notes + '\n' : '') + `Manually updated at ${new Date().toLocaleString()}`
-          });
+          };
+          await updateDoc(doc(db, 'tickets', existing.id), updateData);
+          await syncTicketToSheets({ ...existing, ...updateData, updatedAt: Timestamp.now() } as Ticket);
           setImportStatus(`Ticket #${ticketNumber} updated and restored!`);
         }
       } else {
@@ -983,7 +1086,7 @@ export default function App() {
           const finalStatus = getStatusFromSubject(parsedSubject, rawStatus, content || brief);
           
           if (!existing) {
-            await addDoc(collection(db, 'tickets'), {
+            const data = {
               ticketNumber,
               subject: parsedSubject,
               status: finalStatus,
@@ -997,11 +1100,13 @@ export default function App() {
               processedMessageIds: [msgId],
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
-            });
+            };
+            const docRef = await addDoc(collection(db, 'tickets'), data);
+            await syncTicketToSheets({ ...data, id: docRef.id, createdAt: Timestamp.now(), updatedAt: Timestamp.now() } as Ticket);
             importedCount++;
           } else {
             // Update existing ticket instead of creating new
-            await updateDoc(doc(db, "tickets", existing.id), {
+            const updateData = {
               status: finalStatus,
               brief: brief || existing.brief || "",
               content:
@@ -1013,7 +1118,9 @@ export default function App() {
               updatedAt: serverTimestamp(),
               archived: false,
               deletedAt: null,
-            });
+            };
+            await updateDoc(doc(db, "tickets", existing.id), updateData);
+            await syncTicketToSheets({ ...existing, ...updateData, updatedAt: Timestamp.now() } as Ticket);
             importedCount++;
           }
         }
@@ -1059,6 +1166,7 @@ export default function App() {
     setIsSaving(true);
     try {
       await deleteDoc(doc(db, 'tickets', id));
+      await deleteTicketFromSheets(id);
       setIsAddOpen(false);
       setEditingId(null);
     } catch (err) {
@@ -1540,6 +1648,34 @@ export default function App() {
 
           <div className="mt-4">
             <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-3">System Actions</div>
+            {isAdmin && (
+              <div className="mb-4 px-3 py-4 bg-dash-bg border border-dash-border rounded-lg">
+                <label className="text-[9px] font-black uppercase text-dash-muted block mb-2 tracking-widest">Master Spreadsheet ID</label>
+                <div className="flex gap-2">
+                  <input 
+                    type="text"
+                    value={localSheetId}
+                    onChange={(e) => {
+                      setLocalSheetId(e.target.value);
+                      setSpreadsheetId(e.target.value);
+                    }}
+                    placeholder="Enter Sheet ID..."
+                    className="flex-1 bg-white border border-dash-border text-[10px] rounded px-2 py-1 outline-none focus:border-dash-accent"
+                  />
+                  <button 
+                    onClick={() => {
+                      initializeSheet();
+                      alert("Sheet initialized if ID is valid.");
+                    }}
+                    className="p-1 bg-dash-accent text-white rounded hover:brightness-110"
+                    title="Initialize Sheet"
+                  >
+                    <RefreshCw size={12} />
+                  </button>
+                </div>
+                <p className="mt-2 text-[8px] text-dash-muted leading-tight">Master copy of all data is synced here. Use 44-char ID from Sheets URL.</p>
+              </div>
+            )}
             {!isAdmin && !isAssistant ? (
                <div className="px-3 py-4 bg-dash-bg border border-dash-border rounded-lg text-center">
                  <p className="text-[9px] text-dash-muted uppercase font-bold mb-3">Admin Only Features</p>
@@ -2261,7 +2397,9 @@ export default function App() {
                          try {
                            const updates: any = { status: pendingStatus, manualStatusOverride: true, visitDate: visitDate || null, updatedAt: serverTimestamp() };
 
-                           await updateDoc(doc(db, 'tickets', editingTicket.id), updates);
+                           const fullTicket = { ...editingTicket, ...updates } as Ticket;
+      await updateDoc(doc(db, 'tickets', editingTicket.id), updates)
+        .then(() => syncTicketToSheets(fullTicket));
                            
                          } catch (err) {
                            console.error(err);
@@ -2370,6 +2508,7 @@ export default function App() {
                             updatedAt: serverTimestamp()
                           };
                           await updateDoc(doc(db, 'tickets', editingTicket.id), data);
+                          await syncTicketToSheets({ ...editingTicket, ...data, updatedAt: Timestamp.now() } as Ticket);
                           setIsAddOpen(false);
                         } catch (err: any) {
                           console.error("Update failed:", err);
@@ -2389,7 +2528,9 @@ export default function App() {
                       onClick={async () => {
                         if (editingTicket) {
                           try {
-                            await updateDoc(doc(db, 'tickets', editingTicket.id), { archived: true });
+                            const archivedTicket = { ...editingTicket, archived: true, updatedAt: Timestamp.now() } as Ticket;
+                            await updateDoc(doc(db, 'tickets', editingTicket.id), { archived: true, updatedAt: serverTimestamp() });
+                            await syncTicketToSheets(archivedTicket);
                             setIsAddOpen(false);
                             alert("Ticket archived.");
                           } catch (err: any) {
