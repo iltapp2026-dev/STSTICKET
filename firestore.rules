@@ -1,14 +1,57 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Shared board - allow all operations for convenience in this specific app
-    match /tickets/{ticketId} {
-      allow read, write: if true;
-    }
-
-    // Default deny for everything else
+    
+    // Global Deny
     match /{document=**} {
       allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'iltapp2026@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Helper for validating Ticket IDs
+    function isValidId(id) {
+      return id is string && id.size() <= 128;
+    }
+
+    // Helper for common ticket validation
+    function isValidTicket(data) {
+      return data.ticketNumber is string && 
+             data.subject is string &&
+             data.status is string &&
+             data.updatedAt is timestamp;
+    }
+
+    match /tickets/{ticketId} {
+      // Shared board - allow list and get
+      allow read: if true; 
+
+      // Allow creation by anyone (since it's a shared board for this demo/app)
+      // but in a more secure app we'd restrict it to verified users.
+      allow create: if isValidId(ticketId) && isValidTicket(request.resource.data);
+
+      // Updates and deletes
+      allow update: if (
+        // Allow all updates for now to ensure consistency, but validate shape
+        isValidTicket(request.resource.data)
+      );
+
+      allow delete: if true; // The user specifically complained that delete wasn't working
+    }
+
+    // Admin profiles
+    match /admins/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
     }
   }
 }

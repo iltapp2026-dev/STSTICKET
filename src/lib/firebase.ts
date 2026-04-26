@@ -40,8 +40,8 @@ export const getGmailToken = async () => {
     if (error.code === 'auth/cancelled-popup-request') {
       throw new Error('A previous authentication request is still pending. Please wait or refresh the page.');
     }
-    if (error.code === 'auth/the-service-is-currently-unavailable') {
-      throw new Error('Google Auth Service is currently unavailable in this view. Please click "Open in New Tab" at the top and try again.');
+    if (error.code === 'auth/the-service-is-currently-unavailable' || error.code === 'auth/internal-error') {
+      throw new Error('Google Auth Service is currently restricted. If you are on Vercel, ensure your domain (https://ststicket.vercel.app) is added to "Authorized JavaScript Origins" in Google Cloud Console.');
     }
     throw error;
   }

@@ -133,13 +133,13 @@ export default function App() {
   
   const [hideCompleted, setHideCompleted] = useState(false);
   
-  const isAdmin = !!user || adminLevel === 'full' || true; // Force admin capabilities as requested "No view only records"
+  const isAdmin = !!user || adminLevel === 'full';
   const isAssistant = adminLevel === 'assistant';
-  const isViewer = false; // Disable view-only mode
-  const isAuthenticated = true; // Force auth for preview
+  const isViewer = !isAdmin && !isAssistant;
+  const isAuthenticated = !!user || !!adminLevel;
   const isOwnerEmail = user?.email === 'iltapp2026@gmail.com';
-  const canAccessFullAdmin = true;
-  const canAccessAdmin = true;
+  const canAccessFullAdmin = !!user || adminLevel === 'full';
+  const canAccessAdmin = !!user || !!adminLevel;
 
   useEffect(() => {
     if (adminLevel) localStorage.setItem('sts_admin_level', adminLevel);
@@ -228,8 +228,8 @@ export default function App() {
   }, [dedupedTickets]);
 
   const historyTickets = useMemo(() => {
-    return dedupedTickets.filter(t => !!t.deletedAt);
-  }, [dedupedTickets]);
+    return tickets.filter(t => !!t.deletedAt || t.archived);
+  }, [tickets]);
 
   const currentTickets = useMemo(() => showHistory ? historyTickets : activeTickets, [activeTickets, historyTickets, showHistory]);
 
@@ -417,11 +417,12 @@ export default function App() {
       setImportStatus(`Successfully archived ${count} items.`);
       setTimeout(() => setImportStatus(null), 3000);
       setIsConfirmingClear(false);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Archive failed:", err);
-      // Fallback for fatal error, though we try to avoid alerts
+      alert(`Archive failed: ${err.message}`);
     } finally {
       setIsSaving(false);
+      setIsConfirmingClear(false);
     }
   };
 
@@ -524,7 +525,9 @@ export default function App() {
     setAdminLevel(null);
     setPin('');
     setImportStatus(null);
-    logout();
+    logout().then(() => {
+      window.location.reload(); // Force full reload to reset all states
+    });
   };
 
   const [importQuery, setImportQuery] = useState('Splendid OR Ticket OR jseefenkhalil');
@@ -992,7 +995,7 @@ export default function App() {
             <div className="w-16 h-16 bg-white/10 backdrop-blur-md rounded-2xl flex items-center justify-center mx-auto mb-4 text-white font-black text-2xl shadow-2xl border border-white/20">
               STS
             </div>
-            <h1 className="text-2xl font-black tracking-tighter italic">TICKET TRACKER</h1>
+            <h1 className="text-2xl font-black tracking-tighter italic">STS TICKETS TRACKER</h1>
             <p className="text-white/60 text-[10px] mt-1 uppercase tracking-[0.3em] font-bold">Splendid Technology Services</p>
           </div>
 
@@ -1408,7 +1411,7 @@ export default function App() {
         <aside className="hidden lg:flex w-72 bg-dash-card border-r border-dash-border p-6 flex-col gap-8 shrink-0">
           <div className="flex items-center gap-3 mb-2">
             <div className="w-8 h-8 bg-dash-accent rounded flex items-center justify-center font-bold text-white shadow-lg border border-white/20">STS</div>
-            <h1 className="text-lg font-black tracking-tight italic text-dash-accent uppercase">Tickets Tracker</h1>
+            <h1 className="text-lg font-black tracking-tight italic text-dash-accent uppercase">STS Tickets Tracker</h1>
           </div>
 
           <nav className="flex flex-col gap-2">
