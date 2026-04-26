@@ -45,11 +45,12 @@ import {
   addWeeks,
   isSameWeek
 } from 'date-fns';
-import { useAuth, useTickets } from './lib/hooks';
+import { useTickets } from './lib/hooks';
 import { 
   loginWithGoogle, 
   getGmailToken,
   logout, 
+  ensureAuth,
   getStatusFromSubject, 
   parseEmailHTML,
   softDeleteTickets,
@@ -119,14 +120,65 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+const EmptyState = ({ text }: { text: string }) => (
+  <div className="py-8 text-center bg-dash-bg/30 border border-dashed border-dash-border rounded-2xl">
+    <p className="text-[10px] text-dash-muted font-bold uppercase tracking-widest">{text}</p>
+  </div>
+);
+
+const ActivityCard = ({ ticket, onClick, color }: { ticket: Ticket, onClick: () => void, color: string, key?: string }) => {
+  const colorMap: Record<string, string> = {
+    emerald: 'border-emerald-500/20 hover:border-emerald-500 bg-emerald-500/[0.02]',
+    blue: 'border-blue-500/20 hover:border-blue-500 bg-blue-500/[0.02]',
+    amber: 'border-amber-500/20 hover:border-amber-500 bg-amber-500/[0.02]',
+    dash: 'border-dash-border hover:border-dash-accent bg-dash-card/50'
+  };
+
+  const textColorMap: Record<string, string> = {
+    emerald: 'text-emerald-600',
+    blue: 'text-blue-600',
+    amber: 'text-amber-600',
+    dash: 'text-dash-accent'
+  };
+
+  return (
+    <div 
+      onClick={onClick}
+      className={cn(
+        "p-4 rounded-xl border transition-all cursor-pointer group shadow-sm hover:shadow-md",
+        colorMap[color] || colorMap.dash
+      )}
+    >
+      <div className="flex justify-between items-start mb-2">
+        <span className="text-[9px] font-mono font-bold text-dash-muted">#{ticket.ticketNumber}</span>
+        <span className="text-[8px] font-bold text-dash-muted uppercase">
+          {ticket.updatedAt?.toDate?.() ? format(ticket.updatedAt.toDate(), 'HH:mm') : ''}
+        </span>
+      </div>
+      <h5 className={cn(
+        "text-xs font-bold leading-tight uppercase italic mb-2 line-clamp-2",
+        textColorMap[color] || textColorMap.dash
+      )}>
+        {ticket.subject}
+      </h5>
+      <div className="flex items-center justify-between">
+        <span className="text-[9px] text-dash-muted font-medium truncate max-w-[120px]">{ticket.address || 'No location'}</span>
+        {ticket.visitDate && (
+          <span className="text-[8px] font-black uppercase text-dash-accent italic bg-dash-accent/5 px-1.5 py-0.5 rounded border border-dash-accent/10">
+            {ticket.visitDate}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
-  const { user, loading: authLoading } = useAuth();
   const [pin, setPin] = useState(() => localStorage.getItem('sts_pin') || '');
   const [isDeleting, setIsDeleting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [adminLevel, setAdminLevel] = useState<'full' | null>(() => {
-    const saved = localStorage.getItem('sts_admin_level');
-    return saved === 'full' ? saved : null;
+    return localStorage.getItem('sts_pin') === '7324' ? 'full' : null;
   });
   const [loginMode, setLoginMode] = useState<'admin'>('admin');
   const [autoSync, setAutoSync] = useState(false);
@@ -136,10 +188,12 @@ export default function App() {
   const isAdmin = adminLevel === 'full';
   const isAssistant = false;
   const isViewer = !isAdmin;
-  const isAuthenticated = !!adminLevel;
+  const isAuthenticated = adminLevel === 'full';
   const isOwnerEmail = false; 
   const canAccessFullAdmin = adminLevel === 'full';
-  const canAccessAdmin = !!adminLevel;
+  const canAccessAdmin = adminLevel === 'full';
+
+  const authLoading = false; // We use PIN only now
 
   useEffect(() => {
     if (adminLevel) localStorage.setItem('sts_admin_level', adminLevel);
@@ -153,7 +207,7 @@ export default function App() {
   const { tickets, loading: ticketsLoading } = useTickets(activeUserId);
 
   useEffect(() => {
-    // CRITICAL: Test connection on boot as per guidelines
+    // CRITICAL: Test connection on boot. Auth is not required for public collections.
     const testConnection = async () => {
       try {
         await getDocFromServer(doc(db, 'tickets', 'connection-test'));
@@ -278,23 +332,49 @@ export default function App() {
 
 
   const activityGroups = useMemo(() => {
-    const weekTickets = currentTickets.filter(t => {
-      if (t.archived) return false;
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+
+    const monthTickets = tickets.filter(t => {
+      if (t.archived || t.deletedAt) return false;
       const date = t.updatedAt?.toDate ? t.updatedAt.toDate() : new Date();
-      return isWithinInterval(date, selectedWeek);
+      return date.getMonth() === currentMonth && date.getFullYear() === currentYear;
+    });
+
+    const scheduledTickets = tickets.filter(t => t.status === 'Scheduled' && !t.archived && !t.deletedAt);
+    const scheduledThisMonth = scheduledTickets.filter(t => {
+      if (!t.visitDate) return false;
+      const d = new Date(t.visitDate);
+      return !isNaN(d.getTime()) && d.getMonth() === currentMonth && d.getFullYear() === currentYear;
     });
 
     return {
-      completed: weekTickets.filter(t => t.status === 'Done'),
-      scheduled: currentTickets.filter(t => t.status === 'Scheduled' && !t.archived),
-      open: currentTickets.filter(t => t.status === 'Open' && !t.archived),
-      updated: weekTickets.sort((a, b) => {
-        const da = a.updatedAt?.toDate ? a.updatedAt.toDate().getTime() : 0;
-        const db = b.updatedAt?.toDate ? b.updatedAt.toDate().getTime() : 0;
-        return db - da;
-      }).slice(0, 10)
+      completed: monthTickets.filter(t => t.status === 'Done' || t.status === 'Complete'),
+      scheduled: scheduledThisMonth,
+      waiting: tickets.filter(t => 
+        (t.status === 'Waiting for Parts' || t.status === 'Waiting for Invoice') && !t.archived && !t.deletedAt
+      ),
+      updated: [...tickets]
+        .filter(t => !t.archived && !t.deletedAt)
+        .sort((a, b) => {
+          const da = a.updatedAt?.toDate ? a.updatedAt.toDate().getTime() : 0;
+          const db = b.updatedAt?.toDate ? b.updatedAt.toDate().getTime() : 0;
+          return db - da;
+        }).slice(0, 5)
     };
-  }, [currentTickets, selectedWeek]);
+  }, [tickets]);
+
+  const monthlyBuckets = useMemo(() => {
+    const buckets: { [key: string]: Ticket[] } = {};
+    tickets.filter(t => !t.archived && !t.deletedAt).forEach(t => {
+      const date = t.updatedAt?.toDate ? t.updatedAt.toDate() : new Date();
+      const key = format(date, 'MMMM yyyy');
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(t);
+    });
+    return buckets;
+  }, [tickets]);
 
   // Form state
   const [ticketNumber, setTicketNumber] = useState('');
@@ -488,7 +568,7 @@ export default function App() {
       visitDate: visitDate || null,
       contactName: contactName || null,
       address: address || null,
-      userId: user?.uid || 'admin_pin',
+      userId: adminLevel || 'admin_pin',
       updatedAt: serverTimestamp(),
     };
 
@@ -544,13 +624,12 @@ export default function App() {
   const handleLogout = () => {
     sessionStorage.removeItem('gmail_access_token');
     localStorage.removeItem('sts_admin_level');
-    localStorage.removeItem('sts_viewer');
     localStorage.removeItem('sts_pin');
     setAdminLevel(null);
     setPin('');
     setImportStatus(null);
     logout().then(() => {
-      window.location.reload(); // Force full reload to reset all states
+      window.location.reload(); 
     });
   };
 
@@ -730,7 +809,7 @@ export default function App() {
         const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
         
         if (!existing) {
-          if (!user && !adminLevel) {
+          if (!adminLevel) {
             setImportStatus('You must be logged in as Admin to import.');
             setIsImporting(false);
             return;
@@ -745,7 +824,7 @@ export default function App() {
             visitDate: vDate || null,
             contactName: cName || '',
             address: addr || '',
-            userId: user?.uid || adminLevel || 'SYSTEM',
+            userId: adminLevel || 'SYSTEM',
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
             priority: 'Medium',
@@ -911,7 +990,7 @@ export default function App() {
               visitDate: vDate || null,
               contactName: cName || '',
               address: addr || '',
-              userId: user?.uid || adminLevel || 'SYSTEM',
+              userId: adminLevel || 'SYSTEM',
               processedMessageIds: [msgId],
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
@@ -1023,34 +1102,39 @@ export default function App() {
             <p className="text-white/60 text-[10px] mt-1 uppercase tracking-[0.3em] font-bold">Splendid Technology Services</p>
           </div>
 
-          <div className="p-8 space-y-8">
+          <div className="p-8 space-y-6">
             <div className="space-y-4">
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2 text-center">Security Access PIN</label>
-                  <div className="relative">
-                    <input 
-                      type="password"
-                      placeholder="••••"
-                      maxLength={4}
-                      className="w-full bg-dash-bg border border-dash-border rounded-xl px-4 py-4 text-center text-2xl tracking-[1em] font-bold focus:outline-none focus:ring-2 focus:ring-dash-accent/50 transition-all"
-                      value={pin}
-                      onChange={(e) => {
-                        const val = e.target.value.replace(/\D/g, '');
-                        setPin(val);
+              <div>
+                <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-4 text-center">Enter Security Access PIN</label>
+                <div className="relative">
+                  <input 
+                    type="password"
+                    placeholder="••••"
+                    maxLength={4}
+                    autoFocus
+                    className="w-full bg-dash-bg border-2 border-dash-border rounded-2xl px-4 py-5 text-center text-3xl tracking-[1em] font-black focus:outline-none focus:border-dash-accent/50 transition-all shadow-inner"
+                    value={pin}
+                    onChange={(e) => {
+                      const val = e.target.value.replace(/\D/g, '');
+                      setPin(val);
+                      if (val === '7324') {
                         localStorage.setItem('sts_pin', val);
-                        if (val === '7324') {
-                          setAdminLevel('full');
-                        }
-                      }}
-                    />
-                    {pin.length === 4 && pin !== '7324' && (
-                      <p className="text-red-500 text-[10px] font-bold text-center mt-2 uppercase animate-bounce">Access Denied</p>
-                    )}
-                  </div>
+                        setAdminLevel('full');
+                      }
+                    }}
+                  />
+                  {pin.length === 4 && pin !== '7324' && (
+                    <p className="text-red-500 text-[10px] font-black text-center mt-4 uppercase animate-pulse">Access Denied • Check PIN</p>
+                  )}
                 </div>
-
               </div>
+            </div>
+
+            <div className="pt-4">
+              <p className="text-[9px] text-dash-muted text-center leading-relaxed uppercase font-bold opacity-40">
+                This terminal is restricted to authorized personnel of Splendid Technology Services. 
+                Unauthorized access attempts are logged.
+              </p>
             </div>
           </div>
           
@@ -1528,11 +1612,11 @@ export default function App() {
           <div className="mt-auto pt-6 border-t border-dash-border">
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-8 h-8 rounded-full bg-dash-bg flex items-center justify-center overflow-hidden border border-dash-border">
-                  {isAdmin && user?.photoURL ? <img src={user.photoURL} alt="" /> : <div className="text-xs uppercase font-bold text-dash-accent">{isViewer ? 'V' : (user?.email?.[0] || 'U')}</div>}
+                  {isAuthenticated ? <div className="text-xs uppercase font-bold text-dash-accent">A</div> : <div className="text-xs uppercase font-bold text-dash-accent">R</div>}
                 </div>
                 <div className="flex-1 overflow-hidden">
-                  <p className="text-xs font-bold truncate text-dash-text">{isAdmin ? (user?.displayName || 'Admin') : 'Restricted Access'}</p>
-                  <p className="text-[10px] text-dash-muted truncate">{isAdmin ? user?.email : 'Viewer Mode'}</p>
+                  <p className="text-xs font-bold truncate text-dash-text">{isAuthenticated ? 'Admin Personnel' : 'Restricted Access'}</p>
+                  <p className="text-[10px] text-dash-muted truncate">{isAuthenticated ? 'Splendid Tech Services' : 'Viewer Mode'}</p>
                 </div>
               </div>
               <button 
@@ -1886,127 +1970,124 @@ export default function App() {
                 </div>
               </div>
             ) : view === 'activity' ? (
-              <div className="flex flex-col gap-8 max-w-6xl mx-auto w-full">
-                <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-10 max-w-6xl mx-auto w-full pb-20">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                   <div>
-                    <h2 className="text-2xl font-black tracking-tight flex items-center gap-3 uppercase italic">
-                      <Activity className="text-blue-500" />
-                      Live Activity Command
+                    <h2 className="text-3xl font-black tracking-tighter flex items-center gap-3 uppercase italic">
+                      <Activity className="text-dash-accent" />
+                      Activity Board
                     </h2>
-                    <p className="text-dash-muted text-[10px] font-bold uppercase tracking-[0.2em] mt-1">
-                      Current Operational Period: {format(selectedWeek.start, 'MMM d')} - {format(selectedWeek.end, 'MMM d, yyyy')}
+                    <p className="text-dash-muted text-[10px] font-bold uppercase tracking-[0.3em] mt-1">
+                      Real-time Operations Intelligence
                     </p>
                   </div>
-                  <div className="flex items-center gap-2 bg-dash-card border border-dash-border p-1 rounded-xl shadow-sm">
+                  <div className="flex items-center gap-3">
                     {canAccessAdmin && activeTickets.length > 0 && !showHistory && (
                       <button 
                         onClick={handleClearActivity}
                         disabled={isSaving}
-                        className="px-4 py-2 text-[10px] font-black uppercase tracking-widest bg-red-500 text-white hover:bg-red-600 rounded-lg transition-all flex items-center gap-2 border-r border-dash-border shadow-lg shadow-red-500/20"
+                        className="px-6 py-3 text-[10px] font-black uppercase tracking-widest bg-red-600 text-white hover:bg-red-700 rounded-xl transition-all flex items-center gap-2 shadow-xl shadow-red-600/20"
                       >
                         <History size={14} />
-                        Archive Board
+                        Archive Current Board
                       </button>
                     )}
-                    {showHistory && (
-                      <button 
-                        onClick={() => setShowHistory(false)}
-                        className="px-4 py-2 text-[10px] font-black uppercase tracking-widest bg-emerald-500 text-white hover:bg-emerald-600 rounded-lg transition-all flex items-center gap-2 border-r border-dash-border shadow-lg shadow-emerald-500/20"
-                      >
-                        <History size={14} />
-                        Exit Records
-                      </button>
-                    )}
-                    <button onClick={() => setWeekOffset(v => v - 1)} className="p-2 hover:bg-dash-bg rounded-lg transition-all text-dash-muted">
-                      <ChevronRight size={18} className="rotate-180" />
-                    </button>
-                    <button onClick={() => setWeekOffset(0)} className="px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:text-dash-accent transition-colors border-x border-dash-border">Today</button>
-                    <button onClick={() => setWeekOffset(v => v + 1)} className="p-2 hover:bg-dash-bg rounded-lg transition-all text-dash-muted">
-                      <ChevronRight size={18} />
-                    </button>
                   </div>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-                  {/* Scheduled Future */}
-                  <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-blue-500">
-                      <Calendar size={18} />
-                      <h3 className="text-xs font-black uppercase tracking-widest italic">Upcoming Visits</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-blue-500/10 border border-blue-500/20 rounded-full text-blue-600">{activityGroups.scheduled.length}</span>
-                    </div>
-                    <div className="space-y-4">
-                      {activityGroups.scheduled.map(t => (
-                        <div key={t.id} className="bg-dash-card border border-blue-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-blue-500 cursor-pointer group" onClick={() => openEdit(t)}>
-                          <div className="flex justify-between items-start mb-3">
-                            <div className="flex flex-col gap-1">
-                              <span className="text-[10px] font-mono text-dash-muted font-bold uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</span>
-                              <span className="text-[11px] font-black italic text-blue-600 uppercase tracking-tighter">Visit: {t.visitDate || 'No date set'}</span>
+
+                {/* MONTHLY GROUPING */}
+                <div className="space-y-16">
+                  {Object.entries(monthlyBuckets as Record<string, Ticket[]>).sort((a, b) => {
+                    const dateA = new Date(a[0]);
+                    const dateB = new Date(b[0]);
+                    return dateB.getTime() - dateA.getTime();
+                  }).map(([monthYear, monthTickets]: [string, Ticket[]]) => {
+                    const monthCompleted = monthTickets.filter(t => t.status === 'Done' || t.status === 'Complete');
+                    const monthScheduled = monthTickets.filter(t => t.status === 'Scheduled');
+                    const monthWaiting = monthTickets.filter(t => t.status.toLowerCase().includes('waiting'));
+                    
+                    return (
+                      <div key={monthYear} className="space-y-8">
+                        <div className="flex items-center gap-4">
+                          <div className="h-[1px] flex-1 bg-dash-border" />
+                          <h3 className="text-2xl font-black italic tracking-tighter uppercase text-dash-muted">{monthYear}</h3>
+                          <div className="h-[1px] flex-1 bg-dash-border" />
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                          {/* Completed This Month */}
+                          <div className="space-y-4">
+                            <div className="flex items-center gap-2 text-emerald-500 mb-2">
+                              <CheckCircle2 size={18} />
+                              <h4 className="text-[10px] font-black uppercase tracking-widest italic">Completed</h4>
+                              <span className="ml-auto text-[9px] font-bold px-2 py-0.5 bg-emerald-500/10 rounded-full">{monthCompleted.length}</span>
                             </div>
-                            <span className="text-[9px] font-bold text-dash-muted uppercase bg-dash-bg px-2 py-0.5 rounded border border-dash-border/50">#{t.ticketNumber}</span>
+                            <div className="space-y-3">
+                              {monthCompleted.slice(0, 5).map(t => (
+                                <ActivityCard key={t.id} ticket={t} onClick={() => openEdit(t)} color="emerald" />
+                              ))}
+                              {monthCompleted.length === 0 && <EmptyState text="No completions" />}
+                            </div>
                           </div>
-                          <div className="font-bold text-sm leading-tight group-hover:text-blue-600 transition-colors mb-2 uppercase italic">{t.subject}</div>
-                          <div className="text-[10px] text-dash-muted font-medium truncate italic">{t.address || 'No location provided'}</div>
-                        </div>
-                      ))}
-                      {activityGroups.scheduled.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">No upcoming visits scheduled.</p>}
-                    </div>
-                  </div>
-   
-                  {/* Completed */}
-                  <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-emerald-500">
-                      <CheckCircle2 size={18} />
-                      <h3 className="text-xs font-black uppercase tracking-widest italic">Resolved Hub</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-emerald-500/10 border border-emerald-500/20 rounded-full text-emerald-600">{activityGroups.completed.length}</span>
-                    </div>
-                    <div className="space-y-4">
-                      {activityGroups.completed.map(t => (
-                        <div key={t.id} className="bg-dash-card border border-emerald-500/10 p-5 rounded-2xl shadow-sm hover:shadow-md transition-all border-l-4 border-l-emerald-500 cursor-pointer group" onClick={() => openEdit(t)}>
-                          <div className="flex justify-between items-start mb-2">
-                             <div className="flex flex-col gap-0.5">
-                                <div className="text-[9px] font-mono text-dash-muted font-bold uppercase tracking-tighter">Reference #{t.ticketNumber}</div>
-                                <div className="text-[8px] font-bold text-dash-muted uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</div>
-                             </div>
-                             {t.visitDate && <div className="text-[9px] font-black italic text-emerald-600 bg-emerald-500/5 px-1.5 py-0.5 rounded border border-emerald-500/10">Visit: {t.visitDate}</div>}
+
+                          {/* Scheduled This Month */}
+                          <div className="space-y-4">
+                            <div className="flex items-center gap-2 text-blue-500 mb-2">
+                              <Calendar size={18} />
+                              <h4 className="text-[10px] font-black uppercase tracking-widest italic">Scheduled</h4>
+                              <span className="ml-auto text-[9px] font-bold px-2 py-0.5 bg-blue-500/10 rounded-full">{monthScheduled.length}</span>
+                            </div>
+                            <div className="space-y-3">
+                              {monthScheduled.slice(0, 5).map(t => (
+                                <ActivityCard key={t.id} ticket={t} onClick={() => openEdit(t)} color="blue" />
+                              ))}
+                              {monthScheduled.length === 0 && <EmptyState text="None scheduled" />}
+                            </div>
                           </div>
-                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-emerald-600 transition-colors italic">{t.subject}</div>
-                          <div className="flex items-center gap-2 text-emerald-600 text-[10px] font-black uppercase">
-                             <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
-                             Marked Complete
+
+                          {/* Waiting this Month */}
+                          <div className="space-y-4">
+                            <div className="flex items-center gap-2 text-amber-500 mb-2">
+                              <Clock size={18} />
+                              <h4 className="text-[10px] font-black uppercase tracking-widest italic">Waiting (Parts/Inv)</h4>
+                              <span className="ml-auto text-[9px] font-bold px-2 py-0.5 bg-amber-500/10 rounded-full">{monthWaiting.length}</span>
+                            </div>
+                            <div className="space-y-3">
+                              {monthWaiting.slice(0, 5).map(t => (
+                                <ActivityCard key={t.id} ticket={t} onClick={() => openEdit(t)} color="amber" />
+                              ))}
+                              {monthWaiting.length === 0 && <EmptyState text="All clear" />}
+                            </div>
                           </div>
-                        </div>
-                      ))}
-                      {activityGroups.completed.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">Historical records cleared.</p>}
-                    </div>
-                  </div>
-   
-                  {/* Waiting */}
-                  <div className="flex flex-col gap-5">
-                    <div className="flex items-center gap-2 text-red-500">
-                      <AlertCircle size={18} className="animate-pulse" />
-                      <h3 className="text-xs font-black uppercase tracking-widest italic">Active Queue</h3>
-                      <span className="ml-auto text-[10px] font-bold py-1 px-3 bg-red-500/10 border border-red-500/20 rounded-full text-red-600">{activityGroups.waiting.length}</span>
-                    </div>
-                    <div className="space-y-4">
-                      {activityGroups.waiting.map(t => (
-                        <div key={t.id} className="bg-dash-card border-red-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-red-500 cursor-pointer group" onClick={() => openEdit(t)}>
-                          <div className="flex justify-between items-start mb-2">
-                             <div className="flex flex-col gap-0.5">
-                                <div className="text-[9px] font-mono text-dash-muted font-bold uppercase tracking-tighter">Ticket #{t.ticketNumber}</div>
-                                <div className="text-[8px] font-bold text-dash-muted uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</div>
-                             </div>
-                             {t.visitDate && <div className="text-[9px] font-black italic text-red-600 bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/10">Visit: {t.visitDate}</div>}
-                          </div>
-                          <div className="font-bold text-sm leading-tight mb-3 group-hover:text-red-600 transition-colors font-black uppercase italic">{t.subject}</div>
-                          <div className="flex items-center gap-2">
-                             <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.5)]"></div>
-                             <span className="text-[9px] text-red-600 font-black uppercase tracking-tight">Requires Attention</span>
+
+                          {/* Recently Updated */}
+                          <div className="space-y-4">
+                            <div className="flex items-center gap-2 text-dash-accent mb-2">
+                              <RefreshCw size={18} />
+                              <h4 className="text-[10px] font-black uppercase tracking-widest italic">Recently Updated</h4>
+                            </div>
+                            <div className="space-y-3">
+                              {[...monthTickets]
+                                .sort((a, b) => (b.updatedAt?.toDate?.()?.getTime() || 0) - (a.updatedAt?.toDate?.()?.getTime() || 0))
+                                .slice(0, 5)
+                                .map(t => (
+                                  <ActivityCard key={t.id} ticket={t} onClick={() => openEdit(t)} color="dash" />
+                                ))}
+                            </div>
                           </div>
                         </div>
-                      ))}
-                      {activityGroups.waiting.length === 0 && <p className="text-[10px] text-dash-muted italic text-center py-10">Queue currently clear.</p>}
+                      </div>
+                    );
+                  })}
+
+                  {Object.keys(monthlyBuckets).length === 0 && (
+                    <div className="py-40 text-center space-y-4">
+                      <div className="w-16 h-16 bg-dash-bg border border-dash-border rounded-3xl flex items-center justify-center mx-auto text-dash-muted">
+                        <Activity size={32} />
+                      </div>
+                      <p className="text-sm text-dash-muted italic">No operational activity records found.</p>
                     </div>
-                  </div>
+                  )}
                 </div>
               </div>
             ) : (

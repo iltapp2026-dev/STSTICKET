@@ -1,5 +1,6 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
+import { getAuth, GoogleAuthProvider, signOut, onAuthStateChanged, User } from 'firebase/auth';
+
 import { getFirestore, collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, Timestamp, arrayUnion, writeBatch, documentId } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 
@@ -10,52 +11,63 @@ export { arrayUnion };
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.addScope('https://www.googleapis.com/auth/gmail.readonly');
+googleProvider.addScope('https://www.googleapis.com/auth/spreadsheets');
 googleProvider.setCustomParameters({
   prompt: 'select_account'
 });
 
+/**
+ * CLIENT-SIDE GOOGLE IDENTITY SERVICES (GIS) IMPLEMENTATION
+ * This avoids the "Unauthorized Domain" errors in Firebase Auth because it doesn't 
+ * rely on the internal firebaseapp.com handler page.
+ */
+const CLIENT_ID = '422897157511-gm9kb0g8itqi9jugis86e8vllf70vrlg.apps.googleusercontent.com';
+
+export const getGmailToken = (): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    const cached = sessionStorage.getItem('gmail_access_token');
+    if (cached) {
+      resolve(cached);
+      return;
+    }
+
+    try {
+      // @ts-ignore - GIS library is loaded in index.html
+      const client = google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/spreadsheets',
+        callback: (response: any) => {
+          if (response.error) {
+            reject(new Error(response.error_description || response.error));
+            return;
+          }
+          if (response.access_token) {
+            sessionStorage.setItem('gmail_access_token', response.access_token);
+            resolve(response.access_token);
+          } else {
+            reject(new Error('No access token received'));
+          }
+        },
+      });
+      client.requestAccessToken();
+    } catch (err) {
+      console.error("GIS Error:", err);
+      reject(new Error('Google Identity Services not loaded yet. If you are using an ad-blocker, please disable it for this site and refresh.'));
+    }
+  });
+};
+
 export const loginWithGoogle = async () => {
-  // Keeping this for reference/internal use if needed, but App.tsx will mostly use getGmailToken
-  const result = await signInWithPopup(auth, googleProvider);
-  const credential = GoogleAuthProvider.credentialFromResult(result);
-  const token = credential?.accessToken || null;
-  if (token) {
-    sessionStorage.setItem('gmail_access_token', token);
-  }
-  return result;
+  // We no longer use Firebase Auth for the app lifecycle login.
+  // We use PIN login instead, and call getGmailToken only when needed.
+  return getGmailToken();
 };
 
 export const hasGmailToken = () => !!sessionStorage.getItem('gmail_access_token');
 
-export const getGmailToken = async () => {
-  const cached = sessionStorage.getItem('gmail_access_token');
-  if (cached) return cached;
-  
-  try {
-    // Explicitly requesting scopes for Gmail
-    const result = await signInWithPopup(auth, googleProvider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    const token = credential?.accessToken || null;
-    
-    if (!token) {
-      throw new Error('Failed to obtain Google access token. Please ensure popups are allowed.');
-    }
-
-    sessionStorage.setItem('gmail_access_token', token);
-    return token;
-  } catch (error: any) {
-    console.error("Gmail Auth Error:", error);
-    if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
-      throw new Error('Authentication popup was closed. Please try again and complete the sign-in.');
-    }
-    if (error.code === 'auth/the-service-is-currently-unavailable' || error.code === 'auth/internal-error' || error.code === 'auth/network-request-failed') {
-      throw new Error('Google Auth Service restricted or unavailable. Ensure https://ststicket.vercel.app is added to "Authorized JavaScript Origins" in your Google Cloud Console.');
-    }
-    throw error;
-  }
+export const logout = async () => {
+  sessionStorage.removeItem('gmail_access_token');
 };
-
-export const logout = () => signOut(auth);
 
 export enum OperationType {
   CREATE = 'create',
