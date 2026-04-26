@@ -245,7 +245,25 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   };
 
   const bodyTicket = findNextText('Ticket#') || findNextText('Ticket #') || findNextText('Ticket Number');
-  if (bodyTicket) ticketNumber = bodyTicket.replace(/\D/g, '');
+  if (bodyTicket) {
+    ticketNumber = bodyTicket.replace(/\D/g, '');
+  }
+
+  // Fallback regex for ticket number in body text
+  if (!ticketNumber) {
+    const bodyTicketMatch = mostRecentMessage.match(/(?:Ticket|Service Ticket)\s*#\s*(\d+)/i);
+    if (bodyTicketMatch) {
+      ticketNumber = bodyTicketMatch[1].trim();
+    }
+  }
+
+  // Fallback for subject in body if outer subject is generic
+  if (emailSubject && (emailSubject.toLowerCase().includes('received your email') || emailSubject.toLowerCase().includes('ticket confirmation'))) {
+    const issueMatch = mostRecentMessage.match(/for issue:\s*(.*?)(?:\s*and it has been assigned|\.|\n|$)/i);
+    if (issueMatch) {
+      subject = issueMatch[1].trim();
+    }
+  }
 
   const contactName = findNextText('Contact name') || findNextText('Customer') || '';
   const address = findNextText('Address') || findNextText('Location') || '';
@@ -284,7 +302,17 @@ export function getStatusFromSubject(subject: string, statusRaw?: string, bodyCo
     return 'Scheduled';
   }
 
-  // 2. Open
+  // 2. Done / Resolved
+  const doneKeywords = ["resolved", "completed", "closed", "ticket has been closed", "work is complete"];
+  if (doneKeywords.some(kw => text.includes(kw))) {
+    return 'Done';
+  }
+
+  // 3. Waiting for Parts / Invoice
+  if (text.includes('waiting for parts') || text.includes('parts on order')) return 'Waiting for Parts';
+  if (text.includes('waiting for invoice') || text.includes('invoice sent')) return 'Waiting for Invoice';
+
+  // 4. Open (Default)
   return 'Open';
 }
 
