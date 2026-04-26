@@ -497,13 +497,16 @@ export default function App() {
   }, []);
 
   const handleClearActivity = async () => {
-    if (activeTickets.length === 0) return;
+    const toClear = tickets.filter(t => !t.archived && !t.deletedAt);
+    if (toClear.length === 0) return;
     
-    const count = activeTickets.length;
+    const count = toClear.length;
     
+    if (!window.confirm(`Archive and clear all ${count} tickets from the board?`)) return;
+
     try {
       setIsSaving(true);
-      const allIds = activeTickets.map(t => t.id);
+      const allIds = toClear.map(t => t.id);
       const chunkSize = 200;
       
       for (let i = 0; i < allIds.length; i += chunkSize) {
@@ -1982,14 +1985,24 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
-                    {canAccessAdmin && activeTickets.length > 0 && !showHistory && (
+                    {canAccessAdmin && tickets.some(t => !t.archived && !t.deletedAt) && (
                       <button 
                         onClick={handleClearActivity}
                         disabled={isSaving}
-                        className="px-6 py-3 text-[10px] font-black uppercase tracking-widest bg-red-600 text-white hover:bg-red-700 rounded-xl transition-all flex items-center gap-2 shadow-xl shadow-red-600/20"
+                        className="px-6 py-3 text-[10px] font-black uppercase tracking-widest bg-amber-600 text-white hover:bg-amber-700 rounded-xl transition-all flex items-center gap-2 shadow-xl shadow-amber-600/20 shadow-inner"
                       >
                         <History size={14} />
-                        Archive Current Board
+                        Archive Board Records
+                      </button>
+                    )}
+                    {canAccessAdmin && historyTickets.length > 0 && (
+                      <button 
+                        onClick={handleHardDeleteAll}
+                        disabled={isSaving}
+                        className="px-6 py-3 text-[10px] font-black uppercase tracking-widest bg-red-600 text-white hover:bg-red-700 rounded-xl transition-all flex items-center gap-2 shadow-xl shadow-red-600/20"
+                      >
+                        <Trash2 size={14} />
+                        Hard Erase All (No Recovery)
                       </button>
                     )}
                   </div>
