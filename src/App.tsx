@@ -470,7 +470,7 @@ export default function App() {
     try {
       await updateDoc(doc(db, 'tickets', editingTicket.id), data);
       setIsAddOpen(false);
-      setEditingTicket(null);
+      setEditingId(null);
       setTicketNumber('');
       setSubject('');
       setVisitDate('');
@@ -951,7 +951,7 @@ export default function App() {
     try {
       await deleteDoc(doc(db, 'tickets', id));
       setIsAddOpen(false);
-      setEditingTicket(null);
+      setEditingId(null);
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `tickets/${id}`);
     } finally {
@@ -1408,7 +1408,7 @@ export default function App() {
         <aside className="hidden lg:flex w-72 bg-dash-card border-r border-dash-border p-6 flex-col gap-8 shrink-0">
           <div className="flex items-center gap-3 mb-2">
             <div className="w-8 h-8 bg-dash-accent rounded flex items-center justify-center font-bold text-white shadow-lg border border-white/20">STS</div>
-            <h1 className="text-lg font-black tracking-tight italic text-dash-accent uppercase">Tracker</h1>
+            <h1 className="text-lg font-black tracking-tight italic text-dash-accent uppercase">Tickets Tracker</h1>
           </div>
 
           <nav className="flex flex-col gap-2">
@@ -1534,7 +1534,7 @@ export default function App() {
                 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-dash-muted hover:text-dash-accent transition-colors"
               >
                 <LogOut size={14} />
-                Terminate Session
+                Logout
               </button>
           </div>
         </aside>
@@ -1734,7 +1734,7 @@ export default function App() {
                       </div>
                       <button 
                         onClick={() => {
-                          setEditingTicket(null);
+                          setEditingId(null);
                           setTicketNumber('');
                           setSubject('');
                           setVisitDate('');
