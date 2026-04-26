@@ -1,46 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // 0. Global Safety Net
+    // Shared board - allow all operations for convenience in this specific app
+    match /tickets/{ticketId} {
+      allow read, write: if true;
+    }
+
+    // Default deny for everything else
     match /{document=**} {
       allow read, write: if false;
-    }
-
-    // Helper functions
-    function isSignedIn() {
-      return request.auth != null;
-    }
-
-    function isAdmin() {
-      return isSignedIn() && (
-        request.auth.token.email == 'iltapp2026@gmail.com' ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
-      );
-    }
-
-    function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
-    }
-
-    function incoming() {
-      return request.resource.data;
-    }
-
-    function existing() {
-      return resource.data;
-    }
-
-    function isValidTicket(data) {
-      return data.ticketNumber is string && data.ticketNumber.size() > 0 && data.ticketNumber.size() <= 100 &&
-             data.subject is string && data.subject.size() > 0 && data.subject.size() <= 500 &&
-             data.userId is string &&
-             ( !('visitDate' in data) || data.visitDate == null || (data.visitDate is string && data.visitDate.size() <= 100) );
-    }
-
-    match /tickets/{ticketId} {
-      // Shared board - allow all operations for team convenience
-      // (Used with local PIN authentication)
-      allow read, create, update, delete: if true;
     }
   }
 }

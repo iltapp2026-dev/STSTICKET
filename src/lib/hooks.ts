@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
-import { auth, db, Ticket } from './firebase';
+import { auth, db, Ticket, handleFirestoreError, OperationType } from './firebase';
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null);
@@ -46,7 +46,7 @@ export function useTickets(userId: string | undefined) {
       setTickets(docs);
       setLoading(false);
     }, (error) => {
-      console.error("Error fetching tickets:", error);
+      handleFirestoreError(error, OperationType.LIST, 'tickets');
       setLoading(false);
     });
 

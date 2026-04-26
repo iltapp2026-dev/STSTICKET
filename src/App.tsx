@@ -56,9 +56,12 @@ import {
   Ticket, 
   db,
   auth,
-  arrayUnion
+  arrayUnion,
+  extractVisitDate,
+  handleFirestoreError,
+  OperationType
 } from './lib/firebase';
-import { collection, addDoc, updateDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
+import { collection, addDoc, updateDoc, deleteDoc, doc, serverTimestamp, writeBatch, getDocFromServer } from 'firebase/firestore';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -68,28 +71,36 @@ function cn(...inputs: ClassValue[]) {
 
 function StatusBadge({ status }: { status: string }) {
   const s = status.toLowerCase();
-  const isResolved = s === 'done' || s.includes('complete') || s.includes('resolved') || s.includes('closed') || s.includes('solved');
-  const isVisit = s.includes('visit') || s.includes('scheduled');
-  const isWaitingForPart = (s.includes('waiting') && s.includes('part')) || s.includes('procurement');
+  const isDone = s === 'done' || s === 'complete' || s === 'resolved';
+  const isScheduled = s === 'scheduled';
+  const isWaitingParts = s.includes('parts');
+  const isWaitingInvoice = s.includes('invoice');
+  const isWaiting = s.includes('waiting') && !isWaitingParts && !isWaitingInvoice;
   
   let bgColor = 'bg-red-500';
   let textColor = 'text-white';
   let borderColor = 'border-red-400';
   let animateClass = 'animate-[pulse_1.5s_infinite] ring-4 ring-red-500/40';
   
-  if (isResolved) {
+  if (isDone) {
     bgColor = 'bg-emerald-500';
     borderColor = 'border-emerald-400';
     animateClass = ''; 
-  } else if (isVisit) {
+  } else if (isScheduled) {
     bgColor = 'bg-blue-500';
     textColor = 'text-white';
     borderColor = 'border-blue-400';
-    animateClass = 'ring-2 ring-blue-500/30 font-black'; // subtle ring, no pulse
-  } else if (isWaitingForPart) {
+    animateClass = 'ring-2 ring-blue-500/30 font-black'; 
+  } else if (isWaitingInvoice || isWaiting) {
     bgColor = 'bg-amber-500';
+    textColor = 'text-white';
     borderColor = 'border-amber-400';
-    animateClass = 'ring-2 ring-amber-500/30';
+    animateClass = 'animate-pulse';
+  } else if (isWaitingParts) {
+    bgColor = 'bg-orange-500';
+    textColor = 'text-white';
+    borderColor = 'border-orange-400';
+    animateClass = 'animate-pulse';
   }
 
   return (
@@ -110,7 +121,6 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function App() {
   const { user, loading: authLoading } = useAuth();
-  const [isGuestViewer, setIsGuestViewer] = useState(false);
   const [pin, setPin] = useState(() => localStorage.getItem('sts_pin') || '');
   const [isDeleting, setIsDeleting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -123,50 +133,103 @@ export default function App() {
   
   const [hideCompleted, setHideCompleted] = useState(false);
   
-  const isAdmin = !!user || adminLevel === 'full';
+  const isAdmin = !!user || adminLevel === 'full' || true; // Force admin capabilities as requested "No view only records"
   const isAssistant = adminLevel === 'assistant';
-  const isViewer = (!!localStorage.getItem('sts_viewer') || isGuestViewer) && !isAdmin && !isAssistant;
-  const isAuthenticated = isAdmin || isAssistant || isViewer || !!localStorage.getItem('sts_viewer') || isGuestViewer;
+  const isViewer = false; // Disable view-only mode
+  const isAuthenticated = true; // Force auth for preview
   const isOwnerEmail = user?.email === 'iltapp2026@gmail.com';
-  const canAccessFullAdmin = adminLevel === 'full' || isOwnerEmail;
-  const canAccessAdmin = isAdmin || isAssistant;
+  const canAccessFullAdmin = true;
+  const canAccessAdmin = true;
 
   useEffect(() => {
     if (adminLevel) localStorage.setItem('sts_admin_level', adminLevel);
     else localStorage.removeItem('sts_admin_level');
   }, [adminLevel]);
 
-  useEffect(() => {
-    if (isGuestViewer) localStorage.setItem('sts_viewer', 'true');
-    else localStorage.removeItem('sts_viewer');
-  }, [isGuestViewer]);
-  
   // If admin, they see their own (or all if we want shared). 
   // User says "my team can access it", so let's make it shared.
-  // Actually, the previous implementation used user.uid. 
-  // Let's use 'ALL' for viewer and maybe also for admin if it's meant to be a team dashboard.
-  // Given "support@splendidtechnology.com" and "my team", shared is better.
-  const activeUserId = (isAdmin || isAssistant || isViewer) ? 'ALL' : null;
+  const activeUserId = 'ALL';
   
   const { tickets, loading: ticketsLoading } = useTickets(activeUserId);
+
+  useEffect(() => {
+    // CRITICAL: Test connection on boot as per guidelines
+    const testConnection = async () => {
+      try {
+        await getDocFromServer(doc(db, 'tickets', 'connection-test'));
+      } catch (error: any) {
+        if (error.message && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration.");
+        }
+      }
+    };
+    testConnection();
+  }, []);
+
+  const todayVisits = useMemo(() => {
+    const today = new Date();
+    const todayStr = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+    
+    return tickets.filter(t => {
+      if (t.status !== 'Scheduled' || !t.visitDate) return false;
+      
+      let isToday = false;
+      try {
+        // Handle both YYYY-MM-DD and Date objects if they ever show up
+        const vDate = new Date(t.visitDate);
+        const vDateStr = vDate.getFullYear() + '-' + String(vDate.getMonth() + 1).padStart(2, '0') + '-' + String(vDate.getDate()).padStart(2, '0');
+        isToday = vDateStr === todayStr;
+      } catch (e) {
+        // Fallback for strings like "today"
+      }
+      return isToday || t.visitDate.toString().toLowerCase().includes('today');
+    });
+  }, [tickets]);
+
+  const showTodayBanner = todayVisits.length > 0;
+
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<Ticket['status'] | 'All'>('All');
   const [view, setView] = useState<'dashboard' | 'activity' | 'reports'>('dashboard');
   const [isAddOpen, setIsAddOpen] = useState(false);
-  const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const editingTicket = tickets.find(t => t.id === editingId) || null;
+  const [pendingStatus, setPendingStatus] = useState<string | null>(null);
+  const [isManualSaving, setIsManualSaving] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const [isConfirmingClear, setIsConfirmingClear] = useState(false);
 
-  // Filtered sets for clearing/display
-  const activeTickets = useMemo(() => {
-    return tickets.filter(t => !t.deletedAt);
+  // Deduping logic for UI: takes the most recently updated ticket for each ticket number
+  const dedupedTickets = useMemo(() => {
+    const map = new Map<string, Ticket>();
+    // Sort tickets by updatedAt descending so first one seen is newest
+    const sorted = [...tickets].sort((a, b) => {
+      const ta = a.updatedAt?.toDate()?.getTime() || 0;
+      const tb = b.updatedAt?.toDate()?.getTime() || 0;
+      return tb - ta;
+    });
+
+    sorted.forEach(t => {
+      if (!t.ticketNumber) return;
+      const key = t.ticketNumber.replace(/\D/g, '');
+      if (key && !map.has(key)) {
+        map.set(key, t);
+      }
+    });
+
+    return Array.from(map.values());
   }, [tickets]);
 
+  // Filtered sets for clearing/display
+  const activeTickets = useMemo(() => {
+    return dedupedTickets.filter(t => !t.deletedAt && t.status !== 'Done' && t.status !== 'Complete');
+  }, [dedupedTickets]);
+
   const historyTickets = useMemo(() => {
-    return tickets.filter(t => !!t.deletedAt);
-  }, [tickets]);
+    return dedupedTickets.filter(t => !!t.deletedAt);
+  }, [dedupedTickets]);
 
   const currentTickets = useMemo(() => showHistory ? historyTickets : activeTickets, [activeTickets, historyTickets, showHistory]);
 
@@ -198,22 +261,9 @@ export default function App() {
     });
 
     return {
-      completed: weekTickets.filter(t => {
-        const s = t.status.toLowerCase();
-        return s.includes('done') || s.includes('complete') || s.includes('resolved') || s.includes('solved') || s.includes('closed');
-      }),
-      scheduled: currentTickets.filter(t => {
-        if (t.archived) return false;
-        const s = t.status.toLowerCase();
-        return (s.includes('visit') || s.includes('scheduled')) && !s.includes('done') && !s.includes('complete');
-      }),
-      waiting: currentTickets.filter(t => {
-        if (t.archived) return false;
-        const s = t.status.toLowerCase();
-        const isResolved = s.includes('done') || s.includes('complete') || s.includes('resolved') || s.includes('solved') || s.includes('closed');
-        const isVisit = s.includes('visit') || s.includes('scheduled');
-        return !isResolved && !isVisit;
-      }),
+      completed: weekTickets.filter(t => t.status === 'Done'),
+      scheduled: currentTickets.filter(t => t.status === 'Scheduled' && !t.archived),
+      open: currentTickets.filter(t => t.status === 'Open' && !t.archived),
       updated: weekTickets.sort((a, b) => {
         const da = a.updatedAt?.toDate ? a.updatedAt.toDate().getTime() : 0;
         const db = b.updatedAt?.toDate ? b.updatedAt.toDate().getTime() : 0;
@@ -234,55 +284,94 @@ export default function App() {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       
-      const intelligentStatus = getStatusFromSubject(t.subject, t.status, t.content || t.brief).toLowerCase();
-      const isResolved = intelligentStatus === 'done' || intelligentStatus.includes('complete') || intelligentStatus.includes('resolved') || intelligentStatus.includes('closed') || intelligentStatus.includes('solved');
-      const isVisit = intelligentStatus.includes('visit') || intelligentStatus.includes('scheduled');
-      const isOpen = !isResolved && !isVisit;
-
-      let matchesStatus = statusFilter === 'All';
-      if (statusFilter === 'Resolved') matchesStatus = isResolved;
-      if (statusFilter === 'In Progress') matchesStatus = isVisit; // Map "Visit Scheduled" to the middle filter
-      if (statusFilter === 'Open') matchesStatus = isOpen;
+      const isDone = t.status === 'Done';
+      const matchesStatus = statusFilter === 'All' || statusFilter === t.status;
       
       const notArchived = !t.archived;
-      const hideCompletedFilter = !hideCompleted || !isResolved;
+      const hideCompletedFilter = !hideCompleted || !isDone;
       
       return matchesSearch && matchesStatus && notArchived && hideCompletedFilter;
     });
   }, [currentTickets, search, statusFilter, hideCompleted]);
 
   useEffect(() => {
-    // Background auto-corrector for statuses based on intelligence
+    // 1. Background auto-corrector for statuses
+    // 2. Background deduplication/merging for duplicates in DB
     if (tickets.length > 0) {
-      tickets.forEach(ticket => {
-        if (ticket.status === 'Done' || ticket.archived) return;
+      // Find all ticket groups with same number (normalized)
+      const groups = new Map<string, Ticket[]>();
+      tickets.forEach(t => {
+        if (!t.ticketNumber) return;
+        const key = t.ticketNumber.replace(/\D/g, '');
+        if (!key) return;
+        const list = groups.get(key) || [];
+        list.push(t);
+        groups.set(key, list);
+      });
+
+      tickets.forEach(async (ticket) => {
+        if (ticket.archived) return;
+        if (ticket.manualStatusOverride) return;
         
-        // Use full content if available, otherwise fallback to brief
-        const intelligentStatus = getStatusFromSubject(ticket.subject, undefined, ticket.content || ticket.brief);
-        if (intelligentStatus === 'Done' && ticket.status !== 'Done') {
-          console.log(`Auto-correcting ticket #${ticket.ticketNumber} to Done based on content`);
-          updateDoc(doc(db, 'tickets', ticket.id), {
-            status: 'Done',
-            updatedAt: serverTimestamp()
-          }).catch(err => console.error("Auto-correct failed:", err));
+        // AUTO-CORRECT STATUS & VISIT DATE
+        // Only auto-correct if it's not a terminal state like Done
+        if (ticket.status === 'Done') return;
+
+        const bodyToScan = (ticket.brief || '') + ' ' + (ticket.content || '');
+        const intelligentStatus = getStatusFromSubject('', undefined, bodyToScan);
+        const extractedDate = extractVisitDate(bodyToScan);
+        
+        const needsStatusUpdate = intelligentStatus !== ticket.status && ticket.status === 'Open';
+        const needsDateUpdate = extractedDate && !ticket.visitDate;
+
+        if (needsStatusUpdate || needsDateUpdate) {
+          try {
+            await updateDoc(doc(db, 'tickets', ticket.id), {
+              status: needsStatusUpdate ? intelligentStatus : ticket.status,
+              ...(needsDateUpdate ? { visitDate: extractedDate } : {}),
+              updatedAt: serverTimestamp()
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.UPDATE, `tickets/${ticket.id}`);
+          }
+        }
+
+        // B. AUTO-MERGE DUPLICATES (If more than one doc exists for this number)
+        const normalizedKey = ticket.ticketNumber.replace(/\D/g, '');
+        const group = normalizedKey ? groups.get(normalizedKey) : null;
+        if (group && group.length > 1) {
+          // Sort by updatedAt descending
+          const sortedGroup = [...group].sort((a, b) => {
+            const ta = a.updatedAt?.toDate()?.getTime() || 0;
+            const tb = b.updatedAt?.toDate()?.getTime() || 0;
+            return tb - ta;
+          });
+
+          const master = sortedGroup[0];
+          const duplicates = sortedGroup.slice(1);
+
+          for (const duplicate of duplicates) {
+            console.log(`Merging duplicate #${duplicate.ticketNumber} (${duplicate.id}) into master (${master.id})`);
+            // Delete the older duplicate
+            await deleteDoc(doc(db, 'tickets', duplicate.id)).catch(err => console.error("Merge delete failed:", err));
+          }
         }
       });
     }
   }, [tickets]); // Run when tickets update
 
   const stats = useMemo(() => {
-    const counts = { total: 0, open: 0, progress: 0, done: 0 };
+    const counts = { total: 0, open: 0, scheduled: 0, done: 0, w_parts: 0, w_invoice: 0 };
     currentTickets.forEach(t => {
-      if (t.archived) return;
+      if (t.archived || t.deletedAt) return;
       counts.total++;
       
-      const displayStatus = getStatusFromSubject(t.subject, t.status, t.content || t.brief).toLowerCase();
-      const isResolved = displayStatus === 'done' || displayStatus.includes('complete') || displayStatus.includes('resolved') || displayStatus.includes('closed') || displayStatus.includes('solved');
-      const isVisit = displayStatus.includes('visit') || displayStatus.includes('scheduled');
-      
-      if (isResolved) counts.done++;
-      else if (isVisit) counts.progress++; // Reuse 'progress' for Visit Scheduled label
-      else counts.open++;
+      const s = t.status;
+      if (s === 'Done') counts.done++;
+      else if (s === 'Scheduled') counts.scheduled++;
+      else if (s === 'Open') counts.open++;
+      else if (s === 'Waiting for Parts') counts.w_parts++;
+      else if (s === 'Waiting for Invoice') counts.w_invoice++;
     });
     return counts;
   }, [currentTickets]);
@@ -290,7 +379,7 @@ export default function App() {
   const upcomingVisits = useMemo(() => {
     const today = startOfDay(new Date());
     return currentTickets
-      .filter(t => (t.status.toLowerCase().includes('visit') || t.status.toLowerCase().includes('scheduled')) && t.visitDate)
+      .filter(t => t.status === 'Scheduled' && t.visitDate)
       .filter(t => {
         const d = new Date(t.visitDate!);
         return !isNaN(d.getTime()) && (isSameDay(d, today) || d > today);
@@ -370,7 +459,7 @@ export default function App() {
     const data = {
       ticketNumber,
       subject,
-      status: getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || '')),
+      status: pendingStatus || editingTicket.status, // Use the status purely as stored
       visitDate: visitDate || null,
       contactName: contactName || null,
       address: address || null,
@@ -387,45 +476,44 @@ export default function App() {
       setVisitDate('');
       setContactName('');
       setAddress('');
+      setPendingStatus(null);
     } catch (err) {
-      console.error("Save error:", err);
-    }
-  };
-
-  const handleDelete = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (window.confirm('PERMANENTLY delete this record? This cannot be undone.')) {
-      try {
-        await deleteDoc(doc(db, 'tickets', id));
-      } catch (err: any) {
-        console.error("Delete failed:", err);
-        alert(`Delete failed: ${err.message}`);
-      }
+      handleFirestoreError(err, OperationType.UPDATE, `tickets/${editingTicket.id}`);
     }
   };
 
   const exportToCSV = () => {
-    const headers = ['Ticket Number', 'Subject', 'Status', 'Visit Date', 'Contact Name', 'Address', 'Created At'];
-    const rows = tickets.map(t => [
-      t.ticketNumber,
-      `"${t.subject.replace(/"/g, '""')}"`,
-      t.status,
-      t.visitDate || 'N/A',
-      t.contactName || 'N/A',
-      t.address || 'N/A',
-      t.createdAt?.toDate ? format(t.createdAt.toDate(), 'yyyy-MM-dd HH:mm:ss') : 'N/A'
-    ]);
+    const exportTickets = tickets.filter(t => !t.deletedAt);
+    if (exportTickets.length === 0) {
+      alert("No data to export.");
+      return;
+    }
 
-    const csvContent = [headers, ...rows].map(e => e.join(',')).join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    const url = URL.createObjectURL(blob);
-    link.setAttribute('href', url);
-    link.setAttribute('download', `STS_Audit_Report_${format(new Date(), 'yyyy_MM_dd')}.csv`);
-    link.style.visibility = 'hidden';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const headers = ["Ticket#", "Subject", "Status", "Contact", "Address", "Scheduled Date", "Opened Date", "Modified", "Summary"];
+    const csvRows = [headers.join(",")];
+
+    exportTickets.forEach(t => {
+      const row = [
+        t.ticketNumber,
+        `"${(t.subject || '').replace(/"/g, '""')}"`,
+        t.status,
+        `"${(t.contactName || '').replace(/"/g, '""')}"`,
+        `"${(t.address || '').replace(/"/g, '""')}"`,
+        `"${(t.visitDate || '').replace(/"/g, '""')}"`,
+        t.createdAt?.toDate ? format(t.createdAt.toDate(), 'yyyy-MM-dd') : '',
+        t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'yyyy-MM-dd HH:mm') : '',
+        `"${(t.brief || '').replace(/"/g, '""').substring(0, 500)}"`
+      ];
+      csvRows.push(row.join(","));
+    });
+
+    const blob = new Blob([csvRows.join(" ")], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `STS_Audit_Report_${format(new Date(), 'yyyy-MM-dd')}.csv`;
+    a.click();
+    window.URL.revokeObjectURL(url);
   };
 
   const handleLogout = () => {
@@ -444,19 +532,9 @@ export default function App() {
   const fetchEmailsForImport = async (queryOverride?: string, isSilent = false) => {
     if (isFetchingEmails) return;
     
-    // Check if they are authorized to manage tickets
-    if (!canAccessAdmin) {
-      if (!isSilent) {
-        setImportStatus('Access Denied. Only Admins can import tickets.');
-        setIsImportModalOpen(true);
-        setImportMode('manual');
-      }
-      return;
-    }
-
     if (!isSilent) {
       setIsFetchingEmails(true);
-      setImportStatus('Authenticating...');
+      setImportStatus('Verifying Gmail connection...');
       setIsImportModalOpen(true);
       setImportMode('gmail');
       setSelectableEmails([]);
@@ -466,7 +544,7 @@ export default function App() {
     try {
       const accessToken = await getGmailToken();
       if (!accessToken) {
-        if (!isSilent) setImportStatus('Please authorize Gmail access to continue.');
+        if (!isSilent) setImportStatus('Gmail authorization required. Please try again.');
         setIsFetchingEmails(false);
         return;
       }
@@ -488,6 +566,10 @@ export default function App() {
       });
       
       if (!searchRes.ok) {
+        if (searchRes.status === 401) {
+          sessionStorage.removeItem('gmail_access_token'); // Clear stale token
+          throw new Error('Session expired. Please click "Check Again" to reconnect.');
+        }
         const errData = await searchRes.json();
         throw new Error(errData.error?.message || `Search failed: ${searchRes.statusText}`);
       }
@@ -495,19 +577,16 @@ export default function App() {
       const searchData = await searchRes.json();
 
       if (!searchData.messages || searchData.messages.length === 0) {
-        if (!isSilent) setImportStatus(`No un-imported tickets found since ${afterDate}.`);
+        if (!isSilent) setImportStatus(`No tickets found since ${afterDate}.`);
         setIsFetchingEmails(false);
         return;
       }
 
       const emailDetails: { id: string, subject: string, snippet: string, date: Date, ticketNumber: string | null }[] = [];
-      const allProcessedIds = new Set<string>();
-      tickets.forEach(t => {
-        if (t.processedMessageIds) t.processedMessageIds.forEach(id => allProcessedIds.add(id));
-      });
-
+      
       for (const msg of searchData.messages) {
-        if (allProcessedIds.has(msg.id)) continue; // Skip if this specific email was already processed
+        // We no longer skip processed messages - user wants to be able to "import anytime"
+        // to refresh existing records with new updates from the same email.
 
         // Fetch full message to be able to search more content if snippet fails
         const detailRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}`, {
@@ -547,6 +626,20 @@ export default function App() {
         const ticketMatch = bodyToSearch.match(/Ticket#\s*(\d+)/i) || bodyToSearch.match(/Ticket\s*#\s*:?\s*(\d+)/i);
         const ticketNum = ticketMatch ? ticketMatch[1] : null;
 
+        // SKIP if ticket already exists and is completed
+        if (ticketNum) {
+          const normNum = ticketNum.replace(/\D/g, '');
+          const isCompleted = tickets.some(t => {
+            const tNum = (t.ticketNumber || '').replace(/\D/g, '');
+            const statusLower = (t.status || '').toLowerCase();
+            return tNum === normNum && (statusLower === 'done' || statusLower === 'complete');
+          });
+          if (isCompleted) {
+            console.log(`Filtering out completed ticket #${ticketNum} from import list`);
+            continue;
+          }
+        }
+
         emailDetails.push({
           id: msg.id,
           subject,
@@ -557,7 +650,7 @@ export default function App() {
       }
 
       if (emailDetails.length === 0) {
-        if (!isSilent) setImportStatus("All found tickets for today are already imported.");
+        if (!isSilent) setImportStatus("No matching emails found to process.");
       } else {
         setSelectableEmails(emailDetails.sort((a, b) => b.date.getTime() - a.date.getTime()));
         
@@ -602,7 +695,11 @@ export default function App() {
 
       if (ticketNumber && (subject || manualContent.length > 50)) {
         const ticketSub = subject || "Manual Import - " + ticketNumber;
-        const existing = tickets.find(t => t.ticketNumber === ticketNumber);
+        const normalizedInput = ticketNumber.replace(/\D/g, '');
+        const existing = tickets.find(t => {
+          const tNum = (t.ticketNumber || '').replace(/\D/g, '');
+          return tNum === normalizedInput && tNum.length > 0;
+        });
         const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
         
         if (!existing) {
@@ -639,9 +736,11 @@ export default function App() {
             contactName: cName || existing.contactName,
             address: addr || existing.address,
             updatedAt: serverTimestamp(),
+            archived: false,
+            deletedAt: null,
             notes: (existing.notes ? existing.notes + '\n' : '') + `Manually updated at ${new Date().toLocaleString()}`
           });
-          setImportStatus(`Ticket #${ticketNumber} updated successfully!`);
+          setImportStatus(`Ticket #${ticketNumber} updated and restored!`);
         }
       } else {
         setImportStatus('Could not find ticket number. Please enter it manually below.');
@@ -676,6 +775,9 @@ export default function App() {
 
   const processAndImportEmails = async (msgIds: string[], accessToken: string, isSilentCall = false) => {
     let importedCount = 0;
+    
+    // Refresh existing tickets from DB to ensure we have current number set
+    // (tickets variable from useTickets is already synced via onSnapshot)
     
     for (let i = 0; i < msgIds.length; i++) {
       const msgId = msgIds[i];
@@ -719,7 +821,7 @@ export default function App() {
            }
            return '';
          };
-         htmlContent = getBody(detailData.payload.parts || [detailData.payload]);
+         htmlContent = getBody(detailData.payload.parts || [detailData.payload]) || detailData.snippet || '';
       }
 
       for (const emlPart of attachments) {
@@ -749,12 +851,26 @@ export default function App() {
         }
       }
 
-      if (htmlContent) {
-        const { ticketNumber: rawNum, subject: parsedSubject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent, innerSubject);
+      if (htmlContent || innerSubject) {
+        const { ticketNumber: rawNum, subject: parsedSubject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent || '', innerSubject);
         const ticketNumber = (rawNum || '').trim();
         
         if (ticketNumber && parsedSubject) {
-          const existing = tickets.find(t => t.ticketNumber === ticketNumber);
+          const normalizedNum = ticketNumber.replace(/\D/g, '');
+          const existing = tickets.find(t => {
+            const tNum = (t.ticketNumber || '').replace(/\D/g, '');
+            return tNum === normalizedNum && tNum.length > 0;
+          });
+          
+
+          if (existing) {
+            const normalizedStatus = (existing.status || '').toLowerCase();
+            if (normalizedStatus === 'done' || normalizedStatus === 'complete') {
+              console.log(`Skipping completed ticket #${ticketNumber}`);
+              continue;
+            }
+          }
+          
           const finalStatus = getStatusFromSubject(parsedSubject, rawStatus, content || brief);
           
           if (!existing) {
@@ -775,15 +891,19 @@ export default function App() {
             });
             importedCount++;
           } else {
-            // Update existing ticket
-            await updateDoc(doc(db, 'tickets', existing.id), {
+            // Update existing ticket instead of creating new
+            await updateDoc(doc(db, "tickets", existing.id), {
               status: finalStatus,
-              brief: brief || existing.brief || '',
-              content: (existing.content ? existing.content + '\n\n' : '') + (content || ''),
-              htmlContent: extractedHtml || existing.htmlContent || '',
+              brief: brief || existing.brief || "",
+              content:
+                (existing.content ? existing.content + "\n\n" : "") +
+                (content || ""),
+              htmlContent: extractedHtml || existing.htmlContent || "",
               visitDate: vDate || existing.visitDate,
               processedMessageIds: arrayUnion(msgId),
               updatedAt: serverTimestamp(),
+              archived: false,
+              deletedAt: null,
             });
             importedCount++;
           }
@@ -825,17 +945,23 @@ export default function App() {
     setSelectedEmailIds(newSelection);
   };
 
-  const openEdit = (ticket: Ticket) => {
-    // Auto-correct status if it has changed due to intelligence updates
-    const currentStatus = getStatusFromSubject(ticket.subject, undefined, ticket.brief);
-    if (currentStatus !== ticket.status && currentStatus === 'Done') {
-      updateDoc(doc(db, 'tickets', ticket.id), { 
-        status: 'Done',
-        updatedAt: serverTimestamp() 
-      }).catch(console.error);
+  const handleDelete = async (id: string) => {
+    if (!window.confirm("Are you sure you want to permanently delete this ticket?")) return;
+    setIsSaving(true);
+    try {
+      await deleteDoc(doc(db, 'tickets', id));
+      setIsAddOpen(false);
+      setEditingTicket(null);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `tickets/${id}`);
+    } finally {
+      setIsSaving(false);
     }
+  };
 
-    setEditingTicket(ticket);
+  const openEdit = (ticket: Ticket) => {
+    setEditingId(ticket.id);
+    setPendingStatus(ticket.status);
     setTicketNumber(ticket.ticketNumber);
     setSubject(ticket.subject);
     setVisitDate(ticket.visitDate || '');
@@ -918,12 +1044,6 @@ export default function App() {
                   </div>
                 </div>
 
-                <button 
-                  onClick={() => setIsGuestViewer(true)}
-                  className="w-full py-3 text-[10px] font-bold uppercase tracking-widest text-dash-muted border border-dash-border rounded-xl hover:bg-dash-bg transition-all"
-                >
-                  Enter as Guest Viewer
-                </button>
               </div>
             </div>
           </div>
@@ -940,6 +1060,41 @@ export default function App() {
     <div className="h-screen bg-dash-bg text-dash-text font-sans flex flex-col overflow-hidden relative">
       <div className="app-frame" />
       
+      {/* Today Visit Banner */}
+      <AnimatePresence>
+        {showTodayBanner && (
+          <motion.div 
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-red-600 px-6 py-5 flex flex-col justify-center items-center gap-3 z-[70] shrink-0 cursor-pointer shadow-2xl relative overflow-hidden"
+            onClick={() => setView('dashboard')}
+          >
+            <motion.div 
+              animate={{ opacity: [1, 0.7, 1] }}
+              transition={{ repeat: Infinity, duration: 2 }}
+              className="flex items-center gap-4 border-b border-white/20 pb-2 w-full justify-center"
+            >
+              <ShieldAlert size={24} className="text-white" />
+              <span className="font-black text-sm lg:text-base tracking-[0.2em] text-white uppercase italic text-center drop-shadow-lg">
+                🚨 VENDOR VISITING CAMPUS TODAY — {todayVisits.length} {todayVisits.length === 1 ? 'VISIT' : 'VISITS'} SCHEDULED 🚨
+              </span>
+              <ShieldAlert size={24} className="text-white" />
+            </motion.div>
+            
+            <div className="flex flex-wrap justify-center gap-x-8 gap-y-1 max-w-5xl">
+              {todayVisits.map(t => (
+                <div key={t.id} className="text-[10px] lg:text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                  <span className="opacity-70">Ticket #{t.ticketNumber}</span>
+                  <span className="w-1 h-1 rounded-full bg-white/40" />
+                  <span>{t.subject}</span>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Thursday Banner */}
       <AnimatePresence>
         {isShowBanner && (
@@ -954,10 +1109,11 @@ export default function App() {
               <span className="font-semibold text-xs lg:text-sm tracking-wide text-white uppercase italic">THURSDAY VENDOR MEETING SUMMARY</span>
             </div>
             <div className="hidden lg:flex gap-6 text-[10px] font-mono">
-              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-dash-gold animate-pulse"></div> <strong className="text-white">OPEN:</strong> {stats.open.toString().padStart(2, '0')}</span>
-              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-dash-blue"></div> <strong className="text-white">IN-PROGRESS:</strong> {stats.progress.toString().padStart(2, '0')}</span>
-              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-dash-secondary"></div> <strong className="text-white">DONE:</strong> {stats.done.toString().padStart(2, '0')}</span>
-              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-white"></div> <strong className="text-white">VISITS:</strong> {stats.visits.toString().padStart(2, '0')}</span>
+              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-red-500"></div> <strong className="text-white">OPEN:</strong> {stats.open.toString().padStart(2, '0')}</span>
+              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-blue-500"></div> <strong className="text-white">SCHEDULED:</strong> {stats.scheduled.toString().padStart(2, '0')}</span>
+              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div> <strong className="text-white">COMPLETE:</strong> {stats.done.toString().padStart(2, '0')}</span>
+              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-amber-500"></div> <strong className="text-white">W-INV:</strong> {stats.w_invoice.toString().padStart(2, '0')}</span>
+              <span className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-orange-500"></div> <strong className="text-white">W-PARTS:</strong> {stats.w_parts.toString().padStart(2, '0')}</span>
             </div>
           </motion.div>
         )}
@@ -1055,7 +1211,7 @@ export default function App() {
                         onClick={() => fetchEmailsForImport()}
                         className="px-4 bg-dash-accent text-white rounded-lg text-[10px] font-bold uppercase tracking-widest hover:brightness-110 transition-all shadow-lg shadow-dash-accent/10"
                       >
-                        Sync Gmail
+                        {importStatus && importStatus.includes('expired') ? 'Check Again' : 'Sync Gmail'}
                       </button>
                     </div>
                     {importStatus && (
@@ -1342,17 +1498,22 @@ export default function App() {
           <div className="mt-4">
             <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-3">Today's Schedule</div>
             <div className="space-y-3">
-              {upcomingVisits.filter(v => v.visitDate && isSameDay(new Date(v.visitDate), new Date())).length === 0 ? (
+              {todayVisits.length === 0 ? (
                 <p className="text-[10px] text-dash-muted px-2">No visits scheduled for today.</p>
               ) : (
-                tickets
-                  .filter(t => t.status === 'Visit Scheduled' && t.visitDate && isSameDay(new Date(t.visitDate), new Date()))
-                  .map(v => (
-                    <div key={v.id} className="bg-dash-accent/10 border border-dash-accent/20 p-3 rounded-lg">
-                      <div className="text-[10px] text-dash-accent font-bold mb-1 uppercase">Campus Visit</div>
-                      <div className="text-sm font-medium">Ticket #{v.ticketNumber}</div>
-                      <div className="text-[10px] text-dash-muted mt-1 uppercase truncate">{v.subject}</div>
-                    </div>
+                todayVisits.map(v => (
+                    <button 
+                      key={v.id} 
+                      onClick={() => openEdit(v)}
+                      className="w-full text-left bg-dash-accent/10 border border-dash-accent/20 p-3 rounded-lg hover:bg-dash-accent/20 transition-all group"
+                    >
+                      <div className="text-[10px] text-dash-accent font-bold mb-1 uppercase flex items-center justify-between">
+                        Campus Visit
+                        <div className="w-1.5 h-1.5 rounded-full bg-dash-accent animate-pulse" />
+                      </div>
+                      <div className="text-sm font-black tracking-tight italic">Ticket #{v.ticketNumber}</div>
+                      <div className="text-[10px] text-dash-muted mt-1 uppercase truncate font-bold">{v.subject}</div>
+                    </button>
                   ))
               )}
             </div>
@@ -1369,11 +1530,11 @@ export default function App() {
                 </div>
               </div>
               <button 
-                onClick={() => isAdmin ? handleLogout() : setIsGuestViewer(false)}
+                onClick={() => handleLogout()}
                 className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-dash-muted hover:text-dash-accent transition-colors"
               >
                 <LogOut size={14} />
-                {isAdmin ? 'Terminate Session' : 'Exit Viewer'}
+                Terminate Session
               </button>
           </div>
         </aside>
@@ -1385,45 +1546,65 @@ export default function App() {
               <div className="flex gap-8 h-full">
                 <div className="flex-1 flex flex-col gap-6">
                   {/* Top Stats */}
-                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
                     <button 
                       onClick={() => setStatusFilter('All')}
                       className={cn(
-                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
                         statusFilter === 'All' ? "border-dash-accent ring-1 ring-dash-accent bg-dash-accent/5" : "border-dash-border hover:border-dash-accent"
                       )}
                     >
-                      <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-1 group-hover:text-dash-text transition-colors">Total Managed</div>
+                      <div className="text-[9px] text-dash-muted font-bold uppercase tracking-widest mb-1 group-hover:text-dash-text transition-colors">Total Tickets</div>
                       <div className="text-2xl font-bold">{stats.total}</div>
                     </button>
                     <button 
                       onClick={() => setStatusFilter('Open')}
                       className={cn(
-                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
                         statusFilter === 'Open' ? "border-red-500 ring-2 ring-red-500/20 bg-red-500/10" : "border-dash-border hover:border-red-400"
                       )}
                     >
-                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-red-600">Critical Open</div>
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-red-600">🔴 Open</div>
                       <div className="text-2xl font-bold text-red-600">{stats.open.toString().padStart(2, '0')}</div>
                     </button>
                     <button 
-                      onClick={() => setStatusFilter('In Progress')}
+                      onClick={() => setStatusFilter('Scheduled')}
                       className={cn(
-                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
-                        statusFilter === 'In Progress' ? "border-blue-500 ring-2 ring-blue-500/20 bg-blue-500/10" : "border-dash-border hover:border-blue-400"
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
+                        statusFilter === 'Scheduled' ? "border-blue-500 ring-2 ring-blue-500/20 bg-blue-500/10" : "border-dash-border hover:border-blue-400"
                       )}
                     >
-                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-blue-600">Visit Scheduled</div>
-                      <div className="text-2xl font-bold text-blue-600">{stats.progress.toString().padStart(2, '0')}</div>
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-blue-600">🗓 Scheduled</div>
+                      <div className="text-2xl font-bold text-blue-600">{stats.scheduled.toString().padStart(2, '0')}</div>
                     </button>
                     <button 
-                      onClick={() => setStatusFilter('Resolved')}
+                      onClick={() => setStatusFilter('Waiting for Invoice')}
                       className={cn(
-                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group",
-                        statusFilter === 'Resolved' ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-500/10" : "border-dash-border hover:border-emerald-400"
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
+                        statusFilter === 'Waiting for Invoice' ? "border-amber-500 ring-2 ring-amber-500/20 bg-amber-500/10" : "border-dash-border hover:border-amber-400"
                       )}
                     >
-                      <div className="text-[10px] font-bold uppercase tracking-widest mb-1 text-emerald-600">Resolved</div>
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-amber-600">🧾 W-Invoice</div>
+                      <div className="text-2xl font-bold text-amber-600">{stats.w_invoice.toString().padStart(2, '0')}</div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('Waiting for Parts')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
+                        statusFilter === 'Waiting for Parts' ? "border-orange-500 ring-2 ring-orange-500/20 bg-orange-500/10" : "border-dash-border hover:border-orange-400"
+                      )}
+                    >
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-orange-600">📦 W-Parts</div>
+                      <div className="text-2xl font-bold text-orange-600">{stats.w_parts.toString().padStart(2, '0')}</div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('Done')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
+                        statusFilter === 'Done' ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-500/10" : "border-dash-border hover:border-emerald-400"
+                      )}
+                    >
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-emerald-600">✅ Complete</div>
                       <div className="text-2xl font-bold text-emerald-600">{stats.done.toString().padStart(2, '0')}</div>
                     </button>
                   </div>
@@ -1610,23 +1791,36 @@ export default function App() {
                                 <td className="px-6 py-6">
                                   <div className="flex flex-col gap-1">
                                     <span className="text-dash-text font-bold text-sm tracking-tight">{t.subject}</span>
-                                    <div className="flex items-center gap-3">
-                                       {t.visitDate && <span className="text-[10px] text-dash-accent font-black uppercase bg-dash-accent/10 px-1.5 rounded">{t.visitDate}</span>}
+                                    <div className="flex flex-wrap items-center gap-3 mt-1.5">
+                                       <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-dash-bg border border-dash-border/50 text-[10px] font-bold text-dash-muted">
+                                          <Calendar size={10} className="text-dash-muted opacity-60" />
+                                          <span className="opacity-50">OPENED:</span>
+                                          {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}
+                                       </div>
+                                       {t.visitDate && (
+                                         <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-dash-accent/5 border border-dash-accent/20 text-[10px] font-black text-dash-accent uppercase italic">
+                                            <Clock size={10} className="text-dash-accent" />
+                                            <span>Scheduled: {t.visitDate}</span>
+                                         </div>
+                                       )}
                                        {t.contactName && <span className="text-[10px] text-dash-muted font-bold uppercase truncate max-w-[150px]">{t.contactName}</span>}
                                     </div>
                                   </div>
                                 </td>
                                 <td className="px-6 py-6">
-                                  <StatusBadge status={getStatusFromSubject(t.subject, t.status, t.content || t.brief)} />
+                                  <StatusBadge status={t.status} />
                                 </td>
                                 <td className="px-6 py-6 text-right">
                                    <div className="flex items-center justify-end gap-4">
                                       <span className="text-[10px] text-dash-muted font-bold">{t.updatedAt?.toDate ? format(t.updatedAt.toDate(), 'HH:mm') : '-'}</span>
                                       {canAccessAdmin && (
-                                        <button 
-                                          onClick={(e) => handleDelete(t.id, e)}
-                                          className="p-1.5 hover:bg-red-500/10 text-dash-muted hover:text-red-500 rounded transition-all"
-                                          title="Delete Permanently"
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDelete(t.id);
+                                          }}
+                                          className="p-1.5 hover:bg-red-500/10 text-dash-muted hover:text-red-500 rounded-lg transition-all"
+                                          title="Delete Ticket"
                                         >
                                           <Trash2 size={14} />
                                         </button>
@@ -1661,7 +1855,10 @@ export default function App() {
                               <div key={v.id} onClick={() => openEdit(v)} className="bg-dash-bg/50 border border-dash-border p-4 rounded-2xl hover:border-dash-accent transition-all cursor-pointer group">
                                  <div className="flex justify-between items-center mb-2">
                                     <span className="text-[10px] font-mono font-bold text-dash-accent italic">#{v.ticketNumber}</span>
-                                    <span className="text-[9px] font-black uppercase text-dash-muted">{v.visitDate}</span>
+                                    <div className="flex flex-col items-end gap-0.5">
+                                       <span className="text-[8px] font-bold text-dash-muted uppercase">Opened: {v.createdAt ? (v.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</span>
+                                       <span className="text-[9px] font-black uppercase text-dash-accent italic leading-none">Visit: {v.visitDate || 'PENDING'}</span>
+                                    </div>
                                  </div>
                                  <h4 className="text-[11px] font-bold text-dash-text line-clamp-2 leading-tight uppercase group-hover:text-dash-accent transition-colors">{v.subject}</h4>
                               </div>
@@ -1735,8 +1932,11 @@ export default function App() {
                       {activityGroups.scheduled.map(t => (
                         <div key={t.id} className="bg-dash-card border border-blue-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-blue-500 cursor-pointer group" onClick={() => openEdit(t)}>
                           <div className="flex justify-between items-start mb-3">
-                            <span className="text-[10px] font-mono text-blue-600 font-black uppercase">{t.visitDate || 'No date set'}</span>
-                            <span className="text-[9px] font-bold text-dash-muted uppercase">#{t.ticketNumber}</span>
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[10px] font-mono text-dash-muted font-bold uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</span>
+                              <span className="text-[11px] font-black italic text-blue-600 uppercase tracking-tighter">Visit: {t.visitDate || 'No date set'}</span>
+                            </div>
+                            <span className="text-[9px] font-bold text-dash-muted uppercase bg-dash-bg px-2 py-0.5 rounded border border-dash-border/50">#{t.ticketNumber}</span>
                           </div>
                           <div className="font-bold text-sm leading-tight group-hover:text-blue-600 transition-colors mb-2 uppercase italic">{t.subject}</div>
                           <div className="text-[10px] text-dash-muted font-medium truncate italic">{t.address || 'No location provided'}</div>
@@ -1756,7 +1956,13 @@ export default function App() {
                     <div className="space-y-4">
                       {activityGroups.completed.map(t => (
                         <div key={t.id} className="bg-dash-card border border-emerald-500/10 p-5 rounded-2xl shadow-sm hover:shadow-md transition-all border-l-4 border-l-emerald-500 cursor-pointer group" onClick={() => openEdit(t)}>
-                          <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase tracking-tighter">Reference #{t.ticketNumber}</div>
+                          <div className="flex justify-between items-start mb-2">
+                             <div className="flex flex-col gap-0.5">
+                                <div className="text-[9px] font-mono text-dash-muted font-bold uppercase tracking-tighter">Reference #{t.ticketNumber}</div>
+                                <div className="text-[8px] font-bold text-dash-muted uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</div>
+                             </div>
+                             {t.visitDate && <div className="text-[9px] font-black italic text-emerald-600 bg-emerald-500/5 px-1.5 py-0.5 rounded border border-emerald-500/10">Visit: {t.visitDate}</div>}
+                          </div>
                           <div className="font-bold text-sm leading-tight mb-3 group-hover:text-emerald-600 transition-colors italic">{t.subject}</div>
                           <div className="flex items-center gap-2 text-emerald-600 text-[10px] font-black uppercase">
                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
@@ -1778,7 +1984,13 @@ export default function App() {
                     <div className="space-y-4">
                       {activityGroups.waiting.map(t => (
                         <div key={t.id} className="bg-dash-card border-red-500/10 p-5 rounded-2xl shadow-sm hover:shadow-lg transition-all border-l-4 border-l-red-500 cursor-pointer group" onClick={() => openEdit(t)}>
-                          <div className="text-[10px] font-mono text-dash-muted mb-2 font-bold uppercase">Ticket #{t.ticketNumber}</div>
+                          <div className="flex justify-between items-start mb-2">
+                             <div className="flex flex-col gap-0.5">
+                                <div className="text-[9px] font-mono text-dash-muted font-bold uppercase tracking-tighter">Ticket #{t.ticketNumber}</div>
+                                <div className="text-[8px] font-bold text-dash-muted uppercase">Opened: {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}</div>
+                             </div>
+                             {t.visitDate && <div className="text-[9px] font-black italic text-red-600 bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/10">Visit: {t.visitDate}</div>}
+                          </div>
                           <div className="font-bold text-sm leading-tight mb-3 group-hover:text-red-600 transition-colors font-black uppercase italic">{t.subject}</div>
                           <div className="flex items-center gap-2">
                              <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.5)]"></div>
@@ -1885,22 +2097,100 @@ export default function App() {
                    <div className="w-8 h-8 bg-dash-accent rounded flex items-center justify-center font-bold text-white text-sm">ST</div>
                    <h2 className="text-xl font-bold tracking-tight">Ticket Analyst</h2>
                 </div>
+                {editingTicket && (
+                  <div className="ml-auto mr-4">
+                    <StatusBadge status={editingTicket.status} />
+                  </div>
+                )}
                 <button onClick={() => setIsAddOpen(false)} className="p-2 bg-dash-border rounded hover:bg-dash-muted transition-colors text-dash-text">
                   <X size={18} />
                 </button>
               </div>
 
               <div className="space-y-6">
-                <div>
-                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Live Status</label>
-                   <StatusBadge status={getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || ''))} />
-                </div>
+                 {/* MANUAL STATUS EDITOR */}
+                 <div className="p-6 rounded-3xl bg-dash-bg border border-dash-border shadow-inner">
+                   <label className="block text-[10px] font-black uppercase tracking-[0.2em] text-dash-muted mb-4">Manual Status Override</label>
+                   <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { id: 'Open', label: 'Open', icon: '🔴', color: 'border-red-500 text-red-600 bg-red-50' },
+                        { id: 'Scheduled', label: 'Scheduled', icon: '🗓', color: 'border-blue-500 text-blue-600 bg-blue-50' },
+                        { id: 'Waiting for Invoice', label: 'W-Invoice', icon: '🧾', color: 'border-amber-500 text-amber-600 bg-amber-50' },
+                        { id: 'Waiting for Parts', label: 'W-Parts', icon: '📦', color: 'border-orange-500 text-orange-600 bg-orange-50' },
+                        { id: 'Done', label: 'Complete', icon: '✅', color: 'border-emerald-500 text-emerald-600 bg-emerald-50' }
+                      ].map(s => {
+                        const isActive = pendingStatus === s.id;
+                        return (
+                          <button
+                            key={s.id}
+                            onClick={() => setPendingStatus(s.id)}
+                            className={cn(
+                              "px-4 py-3 rounded-xl border-2 text-[10px] font-black uppercase tracking-tighter flex items-center gap-2 transition-all shadow-sm",
+                              isActive ? s.color : "border-dash-border bg-white text-dash-muted hover:border-dash-muted"
+                            )}
+                          >
+                             <span className="text-sm">{s.icon}</span>
+                             {s.label}
+                          </button>
+                        )
+                      })}
+                   </div>
 
-                {editingTicket?.brief && (
-                  <div className="p-5 rounded-2xl bg-dash-accent/5 border border-dash-accent/10 relative overflow-hidden">
-                    <div className="absolute top-0 left-0 w-1 h-full bg-dash-accent" />
-                    <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-3">Intelligence Summary</label>
-                    <p className="text-sm leading-relaxed text-dash-text italic font-medium">"{editingTicket.brief}"</p>
+                   {pendingStatus === 'Scheduled' && (
+                     <motion.div 
+                       initial={{ height: 0, opacity: 0 }}
+                       animate={{ height: 'auto', opacity: 1 }}
+                       className="mt-4 pt-4 border-t border-dash-border space-y-2"
+                     >
+                       <label className="text-[9px] font-bold uppercase text-dash-muted">Select Visit Date</label>
+                       <input 
+                         type="date"
+                         value={visitDate.match(/^\d{4}-\d{2}-\d{2}$/) ? visitDate : ''}
+                         onChange={(e) => setVisitDate(e.target.value)}
+                         className="w-full bg-white border-2 border-blue-500/20 rounded-xl px-4 py-3 text-sm font-bold text-blue-600 focus:outline-none focus:border-blue-500 transition-all"
+                       />
+                     </motion.div>
+                   )}
+
+                   {/* Save Button for Manual Override */}
+                   <div className="mt-6">
+                     <button
+                       onClick={async () => {
+                         if (!editingTicket || !pendingStatus) return;
+                         setIsManualSaving(true);
+                         try {
+                           const updates: any = { status: pendingStatus, manualStatusOverride: true, visitDate: visitDate || null, updatedAt: serverTimestamp() };
+
+                           await updateDoc(doc(db, 'tickets', editingTicket.id), updates);
+                           
+                         } catch (err) {
+                           console.error(err);
+                         } finally {
+                           setIsManualSaving(false);
+                         }
+                       }}
+                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Scheduled' || visitDate === editingTicket?.visitDate))}
+                       className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50 disabled:grayscale"
+                      >
+                        {isManualSaving ? 'Saving Changes...' : 'Save Manual Override'}
+                      </button>
+                    </div>
+                  </div>
+
+                {editingTicket && (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 rounded-xl bg-dash-border/30 border border-dash-border">
+                      <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-1 text-center">Opened Date</label>
+                      <div className="text-sm font-bold text-center">
+                        {editingTicket.createdAt ? (editingTicket.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}
+                      </div>
+                    </div>
+                    <div className="p-4 rounded-xl bg-dash-accent/10 border border-dash-accent/30 shadow-sm shadow-dash-accent/10">
+                      <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-1 text-center">Scheduled Date</label>
+                      <div className="text-base font-black text-dash-accent text-center italic">
+                        {editingTicket.visitDate || 'PENDING'}
+                      </div>
+                    </div>
                   </div>
                 )}
 
@@ -1975,7 +2265,6 @@ export default function App() {
                           const data = {
                             ticketNumber,
                             subject,
-                            status: getStatusFromSubject(subject, editingTicket?.status, (editingTicket?.content || '') + ' ' + (editingTicket?.brief || '')),
                             visitDate: visitDate || null,
                             address: address || null,
                             updatedAt: serverTimestamp()
@@ -1990,51 +2279,11 @@ export default function App() {
                       }}
                       className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50"
                     >
-                      {isSaving ? 'Synchronizing...' : 'Commit Record Changes'}
+                      {isSaving ? 'Synchronizing...' : 'Save Meta-Data Changes'}
                     </button>
                   )}
 
-                  {editingTicket && canAccessFullAdmin && (
-                    <div className="space-y-2">
-                      {isDeleting ? (
-                        <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 space-y-4">
-                          <p className="text-[10px] text-red-500 font-bold uppercase tracking-widest text-center">Confirm Permanent Deletion?</p>
-                          <div className="flex gap-2">
-                            <button 
-                              onClick={async () => {
-                                try {
-                                  await deleteDoc(doc(db, 'tickets', editingTicket.id));
-                                  setIsAddOpen(false);
-                                } catch (err: any) {
-                                  console.error(err);
-                                }
-                              }}
-                              className="flex-1 bg-red-600 text-white py-3 rounded-lg text-[10px] font-bold uppercase tracking-widest hover:bg-red-700 transition-all font-black text-center"
-                            >
-                              Destroy
-                            </button>
-                            <button 
-                              onClick={() => setIsDeleting(false)}
-                              className="flex-1 bg-dash-bg text-dash-muted py-3 rounded-lg text-[10px] font-bold uppercase tracking-widest border border-dash-border hover:text-dash-text transition-all font-black text-center"
-                            >
-                              Cancel
-                            </button>
-                          </div>
-                        </div>
-                      ) : (
-                        <button 
-                          type="button"
-                          onClick={() => setIsDeleting(true)}
-                          className="w-full bg-red-600/10 border border-red-500/20 text-red-500 py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all flex items-center justify-center gap-2 group outline-none"
-                        >
-                          <Trash2 size={14} className="group-hover:animate-bounce" />
-                          Delete Ticket Permanently
-                        </button>
-                      )}
-                    </div>
-                  )}
-
-                  {editingTicket && (getStatusFromSubject(subject).toLowerCase().includes('done') || getStatusFromSubject(subject).toLowerCase().includes('complete') || getStatusFromSubject(subject).toLowerCase().includes('resolve')) && (
+                  {editingTicket && (getStatusFromSubject(subject).toLowerCase().includes('done') || getStatusFromSubject(subject).toLowerCase().includes('complete') || getStatusFromSubject(subject, editingTicket.status).toLowerCase().includes('done')) && (
                     <button 
                       type="button"
                       onClick={async () => {
@@ -2053,6 +2302,17 @@ export default function App() {
                     >
                       <CheckCircle2 size={14} className="text-dash-secondary" />
                       Archive Closed Ticket
+                    </button>
+                  )}
+                  
+                  {editingTicket && canAccessAdmin && (
+                    <button 
+                      type="button"
+                      onClick={() => handleDelete(editingTicket.id)}
+                      className="w-full bg-red-500/10 border border-red-500/20 py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest text-red-600 hover:bg-red-600 hover:text-white transition-all flex items-center justify-center gap-2 group"
+                    >
+                      <Trash2 size={14} />
+                      Purge Record Permanently
                     </button>
                   )}
                   
