@@ -436,7 +436,13 @@ export default function App() {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       
-      const matchesStatus = statusFilter === 'All' || statusFilter === t.status;
+      const s = (t.status || '').toLowerCase();
+      const isDone = s === 'done' || s === 'complete' || s === 'resolved';
+
+      const matchesStatus = statusFilter === 'All' 
+        ? !isDone // Hide completed tickets from 'All' view
+        : (statusFilter === 'Done' ? isDone : statusFilter === t.status);
+      
       const notArchived = !t.archived;
       
       return matchesSearch && matchesStatus && notArchived;
@@ -1080,7 +1086,7 @@ export default function App() {
           const finalStatus = getStatusFromSubject(parsedSubject, rawStatus, content || brief);
           
           if (!existing) {
-            const data = {
+            const data: any = {
               ticketNumber,
               subject: parsedSubject,
               status: finalStatus,
@@ -1093,7 +1099,7 @@ export default function App() {
               userId: adminLevel || 'SYSTEM',
               processedMessageIds: [msgId],
               createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
             };
             const docRef = await addDoc(collection(db, 'tickets'), data);
             await syncTicketToSheets({ ...data, id: docRef.id, createdAt: Timestamp.now(), updatedAt: Timestamp.now() } as Ticket);
