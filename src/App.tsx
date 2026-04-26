@@ -124,22 +124,22 @@ export default function App() {
   const [pin, setPin] = useState(() => localStorage.getItem('sts_pin') || '');
   const [isDeleting, setIsDeleting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [adminLevel, setAdminLevel] = useState<'assistant' | 'full' | null>(() => {
+  const [adminLevel, setAdminLevel] = useState<'full' | null>(() => {
     const saved = localStorage.getItem('sts_admin_level');
-    return (saved === 'assistant' || saved === 'full') ? saved : null;
+    return saved === 'full' ? saved : null;
   });
-  const [loginMode, setLoginMode] = useState<'admin' | 'viewer'>('admin');
+  const [loginMode, setLoginMode] = useState<'admin'>('admin');
   const [autoSync, setAutoSync] = useState(false);
   
   const [hideCompleted, setHideCompleted] = useState(false);
   
-  const isAdmin = !!user || adminLevel === 'full';
-  const isAssistant = adminLevel === 'assistant';
-  const isViewer = !isAdmin && !isAssistant;
-  const isAuthenticated = !!user || !!adminLevel;
-  const isOwnerEmail = user?.email === 'iltapp2026@gmail.com';
-  const canAccessFullAdmin = !!user || adminLevel === 'full';
-  const canAccessAdmin = !!user || !!adminLevel;
+  const isAdmin = adminLevel === 'full';
+  const isAssistant = false;
+  const isViewer = !isAdmin;
+  const isAuthenticated = !!adminLevel;
+  const isOwnerEmail = false; 
+  const canAccessFullAdmin = adminLevel === 'full';
+  const canAccessAdmin = !!adminLevel;
 
   useEffect(() => {
     if (adminLevel) localStorage.setItem('sts_admin_level', adminLevel);
@@ -168,21 +168,45 @@ export default function App() {
 
   const todayVisits = useMemo(() => {
     const today = new Date();
-    const todayStr = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0') + '-' + String(today.getDate()).padStart(2, '0');
+    const todayY = today.getFullYear();
+    const todayM = today.getMonth() + 1;
+    const todayD = today.getDate();
+    const todayStr = `${todayY}-${String(todayM).padStart(2, '0')}-${String(todayD).padStart(2, '0')}`;
     
     return tickets.filter(t => {
       if (t.status !== 'Scheduled' || !t.visitDate) return false;
       
-      let isToday = false;
-      try {
-        // Handle both YYYY-MM-DD and Date objects if they ever show up
-        const vDate = new Date(t.visitDate);
-        const vDateStr = vDate.getFullYear() + '-' + String(vDate.getMonth() + 1).padStart(2, '0') + '-' + String(vDate.getDate()).padStart(2, '0');
-        isToday = vDateStr === todayStr;
-      } catch (e) {
-        // Fallback for strings like "today"
+      const vDateStr = String(t.visitDate);
+      if (vDateStr.toLowerCase().includes('today')) return true;
+
+      // Handle YYYY-MM-DD (standard for input type="date")
+      if (vDateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+        return vDateStr === todayStr;
       }
-      return isToday || t.visitDate.toString().toLowerCase().includes('today');
+
+      // Handle MM/DD/YYYY
+      if (vDateStr.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
+        const [m, d, y] = vDateStr.split('/');
+        const normalized = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+        return normalized === todayStr;
+      }
+
+      try {
+        // Fallback for objects or other string formats, but be careful of UTC shift
+        // If it's a date object, we use local components
+        const vDate = new Date(t.visitDate);
+        if (isNaN(vDate.getTime())) return false;
+        
+        // If the date string was YYYY-MM-DD, a Date object shift might have happened.
+        // We already handled YYYY-MM-DD strings above, so this fallback is for other cases.
+        const vy = vDate.getFullYear();
+        const vm = vDate.getMonth() + 1;
+        const vd = vDate.getDate();
+        const normalized = `${vy}-${String(vm).padStart(2, '0')}-${String(vd).padStart(2, '0')}`;
+        return normalized === todayStr;
+      } catch (e) {
+        return false;
+      }
     });
   }, [tickets]);
 
@@ -530,7 +554,7 @@ export default function App() {
     });
   };
 
-  const [importQuery, setImportQuery] = useState('Splendid OR Ticket OR jseefenkhalil');
+  const [importQuery, setImportQuery] = useState('from:jseefenkhalil@iltexas.org OR Ticket#');
 
   const fetchEmailsForImport = async (queryOverride?: string, isSilent = false) => {
     if (isFetchingEmails) return;
@@ -1001,22 +1025,6 @@ export default function App() {
 
           <div className="p-8 space-y-8">
             <div className="space-y-4">
-              <div className="text-center">
-                <h3 className="text-sm font-bold uppercase tracking-widest text-dash-muted mb-4">Corporate Login</h3>
-                <button 
-                  onClick={loginWithGoogle}
-                  className="w-full py-4 px-4 rounded-xl bg-dash-accent text-white font-bold hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-3 shadow-lg shadow-dash-accent/20"
-                >
-                  <Mail size={18} />
-                  Login with Google
-                </button>
-              </div>
-
-              <div className="relative flex items-center justify-center py-2">
-                <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-dash-border"></div></div>
-                <span className="relative px-4 bg-dash-card text-[10px] font-bold text-dash-muted uppercase tracking-widest">OR USE PIN</span>
-              </div>
-
               <div className="space-y-4">
                 <div>
                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2 text-center">Security Access PIN</label>
@@ -1033,15 +1041,10 @@ export default function App() {
                         localStorage.setItem('sts_pin', val);
                         if (val === '7324') {
                           setAdminLevel('full');
-                        } else if (val === '2026') {
-                          setAdminLevel('assistant');
-                        } else if (val === '1974') {
-                          // Legacy pin support if needed, otherwise ignore
-                          setAdminLevel('full');
                         }
                       }}
                     />
-                    {pin.length === 4 && pin !== '7324' && pin !== '2026' && pin !== '1974' && (
+                    {pin.length === 4 && pin !== '7324' && (
                       <p className="text-red-500 text-[10px] font-bold text-center mt-2 uppercase animate-bounce">Access Denied</p>
                     )}
                   </div>

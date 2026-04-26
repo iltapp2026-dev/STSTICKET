@@ -10,8 +10,12 @@ export { arrayUnion };
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.addScope('https://www.googleapis.com/auth/gmail.readonly');
+googleProvider.setCustomParameters({
+  prompt: 'select_account'
+});
 
 export const loginWithGoogle = async () => {
+  // Keeping this for reference/internal use if needed, but App.tsx will mostly use getGmailToken
   const result = await signInWithPopup(auth, googleProvider);
   const credential = GoogleAuthProvider.credentialFromResult(result);
   const token = credential?.accessToken || null;
@@ -28,20 +32,24 @@ export const getGmailToken = async () => {
   if (cached) return cached;
   
   try {
+    // Explicitly requesting scopes for Gmail
     const result = await signInWithPopup(auth, googleProvider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     const token = credential?.accessToken || null;
-    if (token) {
-      sessionStorage.setItem('gmail_access_token', token);
+    
+    if (!token) {
+      throw new Error('Failed to obtain Google access token. Please ensure popups are allowed.');
     }
+
+    sessionStorage.setItem('gmail_access_token', token);
     return token;
   } catch (error: any) {
     console.error("Gmail Auth Error:", error);
-    if (error.code === 'auth/cancelled-popup-request') {
-      throw new Error('A previous authentication request is still pending. Please wait or refresh the page.');
+    if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
+      throw new Error('Authentication popup was closed. Please try again and complete the sign-in.');
     }
-    if (error.code === 'auth/the-service-is-currently-unavailable' || error.code === 'auth/internal-error') {
-      throw new Error('Google Auth Service is currently restricted. If you are on Vercel, ensure your domain (https://ststicket.vercel.app) is added to "Authorized JavaScript Origins" in Google Cloud Console.');
+    if (error.code === 'auth/the-service-is-currently-unavailable' || error.code === 'auth/internal-error' || error.code === 'auth/network-request-failed') {
+      throw new Error('Google Auth Service restricted or unavailable. Ensure https://ststicket.vercel.app is added to "Authorized JavaScript Origins" in your Google Cloud Console.');
     }
     throw error;
   }
