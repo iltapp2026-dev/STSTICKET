@@ -231,7 +231,6 @@ export default function App() {
 
     const reconcileWithSheets = async () => {
       if (hasGmailToken()) {
-        setImportStatus('Reconciling with master sheet...');
         try {
           const sheetTickets = await fetchAllTicketsFromSheets();
           const batch = writeBatch(db);
@@ -263,8 +262,6 @@ export default function App() {
           }
         } catch (e) {
           console.error("Master Reconciliation Failed:", e);
-        } finally {
-          setImportStatus(null);
         }
       }
     };
@@ -353,7 +350,7 @@ export default function App() {
 
   // Filtered sets for clearing/display
   const activeTickets = useMemo(() => {
-    return dedupedTickets.filter(t => !t.deletedAt && t.status !== 'Done' && t.status !== 'Complete');
+    return dedupedTickets.filter(t => !t.deletedAt);
   }, [dedupedTickets]);
 
   const historyTickets = useMemo(() => {
@@ -435,19 +432,16 @@ export default function App() {
   const [address, setAddress] = useState('');
 
   const filteredTickets = useMemo(() => {
-    return currentTickets.filter(t => {
+    return activeTickets.filter(t => {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       
-      const isDone = t.status === 'Done';
       const matchesStatus = statusFilter === 'All' || statusFilter === t.status;
-      
       const notArchived = !t.archived;
-      const hideCompletedFilter = !hideCompleted || !isDone;
       
-      return matchesSearch && matchesStatus && notArchived && hideCompletedFilter;
+      return matchesSearch && matchesStatus && notArchived;
     });
-  }, [currentTickets, search, statusFilter, hideCompleted]);
+  }, [activeTickets, search, statusFilter]);
 
   useEffect(() => {
     // 1. Background auto-corrector for statuses
@@ -522,7 +516,7 @@ export default function App() {
       counts.total++;
       
       const s = t.status;
-      if (s === 'Done') counts.done++;
+      if (s === 'Done' || s === 'Complete') counts.done++;
       else if (s === 'Scheduled') counts.scheduled++;
       else if (s === 'Open') counts.open++;
       else if (s === 'Waiting for Parts') counts.w_parts++;
@@ -1647,35 +1641,6 @@ export default function App() {
           </nav>
 
           <div className="mt-4">
-            <div className="text-[10px] text-dash-muted font-bold uppercase tracking-widest mb-3">System Actions</div>
-            {isAdmin && (
-              <div className="mb-4 px-3 py-4 bg-dash-bg border border-dash-border rounded-lg">
-                <label className="text-[9px] font-black uppercase text-dash-muted block mb-2 tracking-widest">Master Spreadsheet ID</label>
-                <div className="flex gap-2">
-                  <input 
-                    type="text"
-                    value={localSheetId}
-                    onChange={(e) => {
-                      setLocalSheetId(e.target.value);
-                      setSpreadsheetId(e.target.value);
-                    }}
-                    placeholder="Enter Sheet ID..."
-                    className="flex-1 bg-white border border-dash-border text-[10px] rounded px-2 py-1 outline-none focus:border-dash-accent"
-                  />
-                  <button 
-                    onClick={() => {
-                      initializeSheet();
-                      alert("Sheet initialized if ID is valid.");
-                    }}
-                    className="p-1 bg-dash-accent text-white rounded hover:brightness-110"
-                    title="Initialize Sheet"
-                  >
-                    <RefreshCw size={12} />
-                  </button>
-                </div>
-                <p className="mt-2 text-[8px] text-dash-muted leading-tight">Master copy of all data is synced here. Use 44-char ID from Sheets URL.</p>
-              </div>
-            )}
             {!isAdmin && !isAssistant ? (
                <div className="px-3 py-4 bg-dash-bg border border-dash-border rounded-lg text-center">
                  <p className="text-[9px] text-dash-muted uppercase font-bold mb-3">Admin Only Features</p>
@@ -1921,35 +1886,21 @@ export default function App() {
                       )}
                     </div>
                     <div className="flex items-center gap-3">
-                      <div className="flex items-center gap-2 bg-dash-card border border-dash-border px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest text-dash-muted">
-                        <span>View Records</span>
-                        <button 
-                          onClick={() => setShowHistory(!showHistory)}
-                          className={cn(
-                            "w-6 h-3 rounded-full transition-all relative",
-                            showHistory ? "bg-red-500" : "bg-dash-border"
-                          )}
-                        >
-                          <div className={cn(
-                            "absolute top-0.5 w-2 h-2 bg-white rounded-full transition-all",
-                            showHistory ? "right-0.5" : "left-0.5"
-                          )} />
-                        </button>
-                      </div>
-                      <div className="flex items-center gap-2 bg-dash-card border border-dash-border px-3 py-1.5 rounded-xl text-[10px] font-bold uppercase tracking-widest text-dash-muted">
-                        <span>Hide Completed</span>
-                        <button 
-                          onClick={() => setHideCompleted(!hideCompleted)}
-                          className={cn(
-                            "w-6 h-3 rounded-full transition-all relative",
-                            hideCompleted ? "bg-dash-accent" : "bg-dash-border"
-                          )}
-                        >
-                          <div className={cn(
-                            "absolute top-0.5 w-2 h-2 bg-white rounded-full transition-all",
-                            hideCompleted ? "right-0.5" : "left-0.5"
-                          )} />
-                        </button>
+                      <div className="flex items-center gap-2 bg-dash-card border border-dash-border p-1 rounded-xl overflow-x-auto max-w-full">
+                        {['All', 'Open', 'Scheduled', 'Waiting for Invoice', 'Waiting for Parts', 'Done'].map(status => (
+                          <button
+                            key={status}
+                            onClick={() => setStatusFilter(status as any)}
+                            className={cn(
+                              "px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all whitespace-nowrap",
+                              statusFilter === status 
+                                ? "bg-dash-accent text-white shadow-lg shadow-dash-accent/20" 
+                                : "text-dash-muted hover:text-dash-text hover:bg-dash-bg"
+                            )}
+                          >
+                            {status === 'Done' ? 'Complete' : status}
+                          </button>
+                        ))}
                       </div>
                       <div className="relative group w-full lg:w-72">
                         <Search size={14} className="absolute left-3 top-2.5 text-dash-muted group-focus-within:text-dash-accent transition-colors" />
