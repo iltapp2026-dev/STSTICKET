@@ -28,7 +28,8 @@ import {
   ListChecks,
   ShieldAlert,
   Upload,
-  History
+  History,
+  Flag
 } from 'lucide-react';
 import { 
   format, 
@@ -53,6 +54,7 @@ import {
   logout, 
   getStatusFromSubject, 
   parseEmailHTML,
+  checkIfUrgent,
   softDeleteTickets,
   Ticket, 
   db,
@@ -315,7 +317,7 @@ export default function App() {
   const showTodayBanner = todayVisits.length > 0;
 
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<Ticket['status'] | 'All'>('All');
+  const [statusFilter, setStatusFilter] = useState<string>('All');
   const [view, setView] = useState<'dashboard' | 'activity' | 'reports'>('dashboard');
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -430,6 +432,7 @@ export default function App() {
   const [visitDate, setVisitDate] = useState('');
   const [contactName, setContactName] = useState('');
   const [address, setAddress] = useState('');
+  const [isFlagged, setIsFlagged] = useState(false);
 
   const filteredTickets = useMemo(() => {
     return activeTickets.filter(t => {
@@ -438,10 +441,11 @@ export default function App() {
       
       const s = (t.status || '').toLowerCase();
       const isDone = s === 'done' || s === 'complete' || s === 'resolved';
+      const isFlaggedFilter = statusFilter === 'Flagged';
 
       const matchesStatus = statusFilter === 'All' 
         ? !isDone // Hide completed tickets from 'All' view
-        : (statusFilter === 'Done' ? isDone : statusFilter === t.status);
+        : (isFlaggedFilter ? t.isFlagged : (statusFilter === 'Done' ? isDone : statusFilter === t.status));
       
       const notArchived = !t.archived;
       
@@ -516,10 +520,12 @@ export default function App() {
   }, [tickets]); // Run when tickets update
 
   const stats = useMemo(() => {
-    const counts = { total: 0, open: 0, scheduled: 0, done: 0, w_parts: 0, w_invoice: 0 };
+    const counts = { total: 0, open: 0, scheduled: 0, done: 0, w_parts: 0, w_invoice: 0, flagged: 0 };
     currentTickets.forEach(t => {
       if (t.archived || t.deletedAt) return;
       counts.total++;
+      
+      if (t.isFlagged) counts.flagged++;
       
       const s = t.status;
       if (s === 'Done' || s === 'Complete') counts.done++;
@@ -1184,6 +1190,7 @@ export default function App() {
     setVisitDate(ticket.visitDate || '');
     setContactName(ticket.contactName || '');
     setAddress(ticket.address || '');
+    setIsFlagged(!!ticket.isFlagged);
     setIsAddOpen(true);
     setIsDeleting(false);
     setIsSaving(false);
@@ -1711,7 +1718,10 @@ export default function App() {
                         Campus Visit
                         <div className="w-1.5 h-1.5 rounded-full bg-dash-accent animate-pulse" />
                       </div>
-                      <div className="text-sm font-black tracking-tight italic">Ticket #{v.ticketNumber}</div>
+                      <div className="text-sm font-black tracking-tight italic flex items-center gap-2">
+                        {v.isFlagged && <Flag size={12} className="text-red-500" fill="currentColor" />}
+                        Ticket #{v.ticketNumber}
+                      </div>
                       <div className="text-[10px] text-dash-muted mt-1 uppercase truncate font-bold">{v.subject}</div>
                     </button>
                   ))
@@ -1746,7 +1756,7 @@ export default function App() {
               <div className="flex gap-8 h-full">
                 <div className="flex-1 flex flex-col gap-6">
                   {/* Top Stats */}
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
                     <button 
                       onClick={() => setStatusFilter('All')}
                       className={cn(
@@ -1756,6 +1766,18 @@ export default function App() {
                     >
                       <div className="text-[9px] text-dash-muted font-bold uppercase tracking-widest mb-1 group-hover:text-dash-text transition-colors">Total Tickets</div>
                       <div className="text-2xl font-bold">{stats.total}</div>
+                    </button>
+                    <button 
+                      onClick={() => setStatusFilter('Flagged')}
+                      className={cn(
+                        "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
+                        statusFilter === 'Flagged' ? "border-red-600 ring-2 ring-red-600/20 bg-red-600/10" : "border-dash-border hover:border-red-400"
+                      )}
+                    >
+                      <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-red-600 flex items-center gap-1">
+                        <Flag size={10} fill="currentColor" /> Priority
+                      </div>
+                      <div className="text-2xl font-bold text-red-600">{stats.flagged.toString().padStart(2, '0')}</div>
                     </button>
                     <button 
                       onClick={() => setStatusFilter('Open')}
@@ -1971,8 +1993,20 @@ export default function App() {
                                   t.status.toLowerCase().includes('visit') && isSameDay(new Date(t.visitDate!), new Date()) && "bg-dash-accent/10 border-l-4 border-l-dash-accent"
                                 )}
                               >
-                                <td className="px-6 py-6 font-mono font-bold text-dash-muted group-hover:text-dash-text">
-                                  #{t.ticketNumber}
+                                <td className="px-6 py-6 font-mono font-bold text-dash-muted group-hover:text-dash-text relative">
+                                  <div className="flex items-center gap-2">
+                                    {t.isFlagged && (
+                                      <motion.div
+                                        animate={{ opacity: [1, 0.5, 1], scale: [1, 1.1, 1] }}
+                                        transition={{ repeat: Infinity, duration: 2 }}
+                                        className="text-red-500"
+                                        title="Urgent Flagged Ticket"
+                                      >
+                                        <Flag size={14} fill="currentColor" />
+                                      </motion.div>
+                                    )}
+                                    <span>#{t.ticketNumber}</span>
+                                  </div>
                                 </td>
                                 <td className="px-6 py-6">
                                   <div className="flex flex-col gap-1">
@@ -2304,6 +2338,29 @@ export default function App() {
                  {/* MANUAL STATUS EDITOR */}
                  <div className="p-6 rounded-3xl bg-dash-bg border border-dash-border shadow-inner">
                    <label className="block text-[10px] font-black uppercase tracking-[0.2em] text-dash-muted mb-4">Manual Status Override</label>
+                   
+                   <div className="flex items-center gap-3 mb-6 p-4 rounded-2xl bg-white border border-dash-border/50">
+                      <div className={cn(
+                        "w-10 h-10 rounded-full flex items-center justify-center transition-all",
+                        isFlagged ? "bg-red-500 text-white shadow-lg shadow-red-500/30" : "bg-dash-bg text-dash-muted"
+                      )}>
+                        <Flag size={20} fill={isFlagged ? "currentColor" : "none"} />
+                      </div>
+                      <div className="flex-1">
+                        <div className="text-xs font-bold text-dash-text uppercase tracking-tight">Red Flag Priority</div>
+                        <div className="text-[10px] text-dash-muted font-medium">Highlight this ticket as urgent</div>
+                      </div>
+                      <button 
+                        onClick={() => setIsFlagged(!isFlagged)}
+                        className={cn(
+                          "px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all",
+                          isFlagged ? "bg-red-600 text-white" : "bg-dash-bg border border-dash-border text-dash-muted hover:bg-dash-border"
+                        )}
+                      >
+                        {isFlagged ? 'Flagged' : 'Flag'}
+                      </button>
+                   </div>
+
                    <div className="grid grid-cols-2 gap-2">
                       {[
                         { id: 'Open', label: 'Open', icon: '🔴', color: 'border-red-500 text-red-600 bg-red-50' },
@@ -2352,7 +2409,7 @@ export default function App() {
                          if (!editingTicket || !pendingStatus) return;
                          setIsManualSaving(true);
                          try {
-                           const updates: any = { status: pendingStatus, manualStatusOverride: true, visitDate: visitDate || null, updatedAt: serverTimestamp() };
+                           const updates: any = { status: pendingStatus, manualStatusOverride: true, visitDate: visitDate || null, isFlagged: isFlagged, updatedAt: serverTimestamp() };
 
                            const fullTicket = { ...editingTicket, ...updates } as Ticket;
       await updateDoc(doc(db, 'tickets', editingTicket.id), updates)
@@ -2364,7 +2421,7 @@ export default function App() {
                            setIsManualSaving(false);
                          }
                        }}
-                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Scheduled' || visitDate === editingTicket?.visitDate))}
+                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Scheduled' || visitDate === editingTicket?.visitDate) && isFlagged === !!editingTicket?.isFlagged)}
                        className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50 disabled:grayscale"
                       >
                         {isManualSaving ? 'Saving Changes...' : 'Save Manual Override'}

@@ -126,6 +126,7 @@ export interface Ticket {
   content?: string; // Full text content for display
   htmlContent?: string;
   processedMessageIds?: string[];
+  isFlagged?: boolean;
 }
 
 export type TicketInput = Omit<Ticket, 'id' | 'createdAt' | 'updatedAt' | 'userId'>;
@@ -314,6 +315,12 @@ export function getStatusFromSubject(subject: string, statusRaw?: string, bodyCo
 
   // 4. Open (Default)
   return 'Open';
+}
+
+export function checkIfUrgent(subject: string, body: string): boolean {
+  const combined = (subject + ' ' + body).toLowerCase();
+  const urgentKeywords = ["red flag", "urgent", "critical", "emergency", "asap", "priority 1", "p1"];
+  return urgentKeywords.some(kw => combined.includes(kw));
 }
 
 export async function softDeleteTickets(ids: string[]) {
