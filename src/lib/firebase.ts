@@ -131,17 +131,38 @@ export interface Ticket {
 
 export type TicketInput = Omit<Ticket, 'id' | 'createdAt' | 'updatedAt' | 'userId'>;
 
-export function extractVisitDate(content: string): string {
-  const dateRegex = /\b((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?,? \d{0,4})\b|today|tomorrow\b/i;
-  const visitKeywords = ["will visit", "scheduled for", "technician will be on site", "plan to visit", "coming to campus"];
+export function extractVisitDate(content: string, referenceDate?: Date): string {
+  const dateRegex = /\b((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?,? \d{0,4})\b/i;
+  const visitKeywords = ["will visit", "scheduled for", "technician will be on site", "plan to visit", "coming to campus", "will install", "scheduled to install", "scheduled for install"];
   
   const lowerContent = content.toLowerCase();
-  const hasVisitKeyword = visitKeywords.some(kw => lowerContent.includes(kw));
+  const ref = referenceDate || new Date();
   
+  // Handle relative terms relative to email date
+  if (lowerContent.includes('tomorrow') && (visitKeywords.some(kw => lowerContent.includes(kw)) || lowerContent.includes('visit'))) {
+    const tomorrow = new Date(ref);
+    tomorrow.setDate(ref.getDate() + 1);
+    return tomorrow.toISOString().split('T')[0];
+  }
+  
+  if (lowerContent.includes('today') && (visitKeywords.some(kw => lowerContent.includes(kw)) || lowerContent.includes('visit'))) {
+    return ref.toISOString().split('T')[0];
+  }
+
+  const hasVisitKeyword = visitKeywords.some(kw => lowerContent.includes(kw));
+  // Be VERY strict - only extract visit date if there is a clear visit keyword
   if (hasVisitKeyword) {
-    // Look for a date in the same paragraph/line or nearby
     const m = content.match(dateRegex);
-    if (m) return m[0];
+    if (m) {
+      const dateStr = m[0];
+      try {
+        const d = new Date(dateStr);
+        if (!isNaN(d.getTime())) {
+          return d.toISOString().split('T')[0];
+        }
+      } catch (e) {}
+      return dateStr;
+    }
   }
 
   return '';
@@ -157,47 +178,117 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   brief: string;
   content: string;
   htmlContent: string;
+  createdAt: Timestamp | null;
 } {
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
-  const bodyText = (doc.body?.innerText || html).trim();
   
-  // Isolate most recent message in thread
-  const threadMarkers = [
-    'From:', 
-    'On ', 
-    '---', 
-    '____________', 
-    'Get Outlook for',
-    'Sent from my'
-  ];
+  // Remove script and style elements to get cleaner text
+  const scripts = doc.querySelectorAll('script, style');
+  scripts.forEach(s => s.remove());
   
-  let splitIndex = bodyText.length;
-  for (const marker of threadMarkers) {
-    const idx = bodyText.indexOf(marker);
-    if (idx !== -1 && idx < splitIndex && idx > 5) {
-      splitIndex = idx;
-    }
-  }
-  
-  const mostRecentMessage = bodyText.substring(0, splitIndex).trim();
+  const bodyText = (doc.body?.innerText || html || '').trim();
   
   // 1. Extraction from Subject Line
   let ticketNumber = '';
   let subject = '';
 
   if (emailSubject) {
-    const ticketMatch = emailSubject.match(/Ticket#(\s*\d+)/i);
+    // Improved detection for Service Ticket #92000
+    const ticketMatch = emailSubject.match(/(?:Service\s+)?Ticket\s*#?\s*(\d+)/i) || 
+                         bodyText.match(/(?:Service\s+)?Ticket\s*#?\s*(\d+)/i);
     if (ticketMatch) ticketNumber = ticketMatch[1].trim();
 
     const subjectMatch = emailSubject.match(/(?:IL\s?Texas\s*-\s*)(.*?)\s*--/i) || 
-                         emailSubject.match(/(?:-\s*)(.*?)\s*--/i);
+                         emailSubject.match(/(?:-\s*)(.*?)\s*--/i) ||
+                         bodyText.match(/request for ["'](.*?)["']/i) ||
+                         bodyText.match(/issue:\s*(.*?)(?:\s*and it has been assigned|\.|\n|$)/i);
     if (subjectMatch) {
       subject = subjectMatch[1].trim();
     } else {
-      subject = emailSubject.replace(/^(FW|RE|FWD|CC):\s*/i, '').trim();
+      subject = emailSubject.replace(/^(FW|RE|FWD|CC):\s*/i, '')
+                            .replace(/Service Ticket\s*#\d+\s*has been received/i, 'Service Request')
+                            .replace(/Ticket\s*#\d+/i, '')
+                            .trim();
+      if (!subject || subject === '-') subject = 'Service Request';
     }
   }
+
+  // 1. Isolate the "Header Block" vs "Message Body"
+  const headerBlockMarkers = [
+    '---------- Forwarded message ----------',
+    'From:', 
+    'Sent:',
+    'Date:',
+    'Subject:',
+    'To:',
+    'Cc:'
+  ];
+
+  // Extract "Original Date" from the text following a Date/Sent prefix
+  let parsedCreatedAt: Timestamp | null = null;
+  const dateLinePrefixes = ['Date:', 'Sent:', 'Originally sent:'];
+
+  // Robust cleanup of headers - catching Narrow No-Break Space and other UTF-8 variants
+  const firstSection = bodyText.substring(0, 3000);
+  const cleanerHeaderArea = firstSection
+    .replace(/[\u202F\u2000-\u200B\uFEFF\xA0]/g, ' ') 
+    .replace(/[^\x20-\x7E\s]/g, ' '); 
+
+  const headerDateLinePrefixes = ['Date:', 'Sent:', 'Originally sent:', 'On '];
+  const headerLines = cleanerHeaderArea.split('\n');
+
+  for (const line of headerLines) {
+    const trimmed = line.trim();
+    if (headerDateLinePrefixes.some(p => trimmed.toLowerCase().startsWith(p.toLowerCase()))) {
+      // Matches: Tuesday, April 14, 2026 or 14 April 2026
+      const dateRegex = /(?:[A-Z][a-z]+,?\s+)?([A-Z][a-z]+\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*\d{4})|(\d{1,2}\s+[A-Z][a-z]+\s*,?\s*\d{4})/i;
+      const match = trimmed.match(dateRegex);
+      
+      if (match) {
+        const dateStr = (match[1] || match[2]).trim();
+        try {
+          const cleanPart = dateStr.split(/\s+at\s+/i)[0].trim();
+          const d = new Date(cleanPart);
+          if (!isNaN(d.getTime())) {
+            parsedCreatedAt = Timestamp.fromDate(d);
+            break;
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  const lines = bodyText.split(/\r?\n/);
+  const content = bodyText;
+  
+  // Identify where real content starts
+  let contentStartIdx = 0;
+  for (let i = 0; i < Math.min(lines.length, 40); i++) {
+    const line = lines[i].trim();
+    if (line.toLowerCase().startsWith('subject:')) {
+      contentStartIdx = i + 1;
+      while (contentStartIdx < lines.length && (lines[contentStartIdx].trim() === '' || lines[contentStartIdx].includes(': '))) {
+        contentStartIdx++;
+      }
+      break;
+    }
+  }
+
+  const mostRecentLines = lines.slice(contentStartIdx);
+  const mostRecentMessage = mostRecentLines.join('\n').trim();
+  
+  const searchableForVisitDate = mostRecentLines
+    .filter(line => {
+      const l = line.trim().toLowerCase();
+      return !l.startsWith('from:') && !l.startsWith('to:') && !l.startsWith('date:') && 
+             !l.startsWith('sent:') && !l.startsWith('subject:') && !l.startsWith('cc:');
+    })
+    .join('\n');
+
+  // Context-aware visit date extraction
+  const referenceDate = parsedCreatedAt ? parsedCreatedAt.toDate() : new Date();
+  const vDate = extractVisitDate(searchableForVisitDate, referenceDate);
 
   // 2. Data Extraction
   const allElements = Array.from(doc.querySelectorAll('td, b, span, div, p, strong, label, th, font'));
@@ -250,27 +341,20 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
     ticketNumber = bodyTicket.replace(/\D/g, '');
   }
 
-  // Fallback regex for ticket number in body text
   if (!ticketNumber) {
-    const bodyTicketMatch = mostRecentMessage.match(/(?:Ticket|Service Ticket)\s*#\s*(\d+)/i);
+    const bodyTicketMatch = bodyText.match(/(?:Service\s+)?Ticket\s*#?\s*:?\s*(\d+)/i);
     if (bodyTicketMatch) {
       ticketNumber = bodyTicketMatch[1].trim();
     }
   }
 
-  // Fallback for subject in body if outer subject is generic
-  if (emailSubject && (emailSubject.toLowerCase().includes('received your email') || emailSubject.toLowerCase().includes('ticket confirmation'))) {
-    const issueMatch = mostRecentMessage.match(/for issue:\s*(.*?)(?:\s*and it has been assigned|\.|\n|$)/i);
-    if (issueMatch) {
-      subject = issueMatch[1].trim();
-    }
+  if (ticketNumber && !subject) {
+    subject = `Service Request #${ticketNumber}`;
   }
 
   const contactName = findNextText('Contact name') || findNextText('Customer') || '';
   const address = findNextText('Address') || findNextText('Location') || '';
   
-  const vDate = extractVisitDate(mostRecentMessage);
-
   // Extract a "brief"
   let brief = '';
   const signatureIdx = mostRecentMessage.search(/\b(thanks|thank you|sincerely|best|regards|reguards|sent from|this email|confidentiality notice)\b/i);
@@ -278,29 +362,37 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   brief = brief.replace(/\s+/g, ' ').trim();
   if (brief.length > 400) brief = brief.substring(0, 397) + '...';
 
+  const finalStatus = getStatusFromSubject('', '', searchableForVisitDate);
+
   return { 
     ticketNumber, 
     subject: subject || (ticketNumber ? `Support Ticket ${ticketNumber}` : 'Support Request'), 
-    status: getStatusFromSubject('', '', mostRecentMessage), // Status derived ONLY from body text
+    status: finalStatus === 'Scheduled' ? 'Visit Scheduled' : finalStatus, 
     contactName,
     address,
     visitDate: vDate,
     brief,
     content: mostRecentMessage,
-    htmlContent: html
+    htmlContent: html,
+    createdAt: parsedCreatedAt
   };
 }
 
 export function getStatusFromSubject(subject: string, statusRaw?: string, bodyContent?: string): string {
   const text = (bodyContent || '').toLowerCase();
   
+  // 0. Urgent (Red Flag)
+  if (text.includes('red flag') || text.includes('urgent') || text.includes('priority 1') || text.includes('p1')) {
+    return 'Urgent';
+  }
+
   // 1. Scheduled
-  const scheduledKeywords = ["will visit", "scheduled for", "technician will be on site", "plan to visit", "coming to campus"];
+  const scheduledKeywords = ["will visit", "scheduled for", "technician will be on site", "plan to visit", "coming to campus", "will install", "scheduled to install", "scheduled for install"];
   const dateRegex = /\b((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\s*,?\s*)?(\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}(?:st|nd|rd|th)?,? \d{0,4})\b|today|tomorrow\b/i;
   
   const hasScheduledKeyword = scheduledKeywords.some(kw => text.includes(kw));
   if (hasScheduledKeyword && dateRegex.test(text)) {
-    return 'Scheduled';
+    return 'Visit Scheduled';
   }
 
   // 2. Done / Resolved
@@ -313,7 +405,8 @@ export function getStatusFromSubject(subject: string, statusRaw?: string, bodyCo
   if (text.includes('waiting for parts') || text.includes('parts on order')) return 'Waiting for Parts';
   if (text.includes('waiting for invoice') || text.includes('invoice sent')) return 'Waiting for Invoice';
 
-  // 4. Open (Default)
+  // 4. Open (Default / Received)
+  if (text.includes('received') || text.includes('assigned')) return 'Open';
   return 'Open';
 }
 

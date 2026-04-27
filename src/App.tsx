@@ -83,7 +83,7 @@ function cn(...inputs: ClassValue[]) {
 function StatusBadge({ status }: { status: string }) {
   const s = status.toLowerCase();
   const isDone = s === 'done' || s === 'complete' || s === 'resolved';
-  const isScheduled = s === 'scheduled';
+  const isScheduled = s.includes('scheduled') || s.includes('visit');
   const isWaitingParts = s.includes('parts');
   const isWaitingInvoice = s.includes('invoice');
   const isWaiting = s.includes('waiting') && !isWaitingParts && !isWaitingInvoice;
@@ -278,15 +278,13 @@ export default function App() {
     const todayStr = `${todayY}-${String(todayM).padStart(2, '0')}-${String(todayD).padStart(2, '0')}`;
     
     return tickets.filter(t => {
-      if (t.status !== 'Scheduled' || !t.visitDate) return false;
+      if (!t.status.toLowerCase().includes('scheduled') || !t.visitDate) return false;
       
-      const vDateStr = String(t.visitDate);
+      const vDateStr = String(t.visitDate).trim();
       if (vDateStr.toLowerCase().includes('today')) return true;
 
-      // Handle YYYY-MM-DD (standard for input type="date")
-      if (vDateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
-        return vDateStr === todayStr;
-      }
+      // Robust check for today in local time
+      if (vDateStr === todayStr) return true;
 
       // Handle MM/DD/YYYY
       if (vDateStr.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
@@ -296,13 +294,11 @@ export default function App() {
       }
 
       try {
-        // Fallback for objects or other string formats, but be careful of UTC shift
-        // If it's a date object, we use local components
+        // Fallback for objects or other string formats
         const vDate = new Date(t.visitDate);
         if (isNaN(vDate.getTime())) return false;
         
-        // If the date string was YYYY-MM-DD, a Date object shift might have happened.
-        // We already handled YYYY-MM-DD strings above, so this fallback is for other cases.
+        // Use local components to avoid UTC shift
         const vy = vDate.getFullYear();
         const vm = vDate.getMonth() + 1;
         const vd = vDate.getDate();
@@ -392,7 +388,7 @@ export default function App() {
       return date.getMonth() === currentMonth && date.getFullYear() === currentYear;
     });
 
-    const scheduledTickets = tickets.filter(t => t.status === 'Scheduled' && !t.archived && !t.deletedAt);
+    const scheduledTickets = tickets.filter(t => t.status.toLowerCase().includes('scheduled') && !t.archived && !t.deletedAt);
     const scheduledThisMonth = scheduledTickets.filter(t => {
       if (!t.visitDate) return false;
       const d = new Date(t.visitDate);
@@ -435,7 +431,7 @@ export default function App() {
   const [isFlagged, setIsFlagged] = useState(false);
 
   const filteredTickets = useMemo(() => {
-    return activeTickets.filter(t => {
+    const filtered = activeTickets.filter(t => {
       const matchesSearch = t.ticketNumber.toLowerCase().includes(search.toLowerCase()) || 
                             t.subject.toLowerCase().includes(search.toLowerCase());
       
@@ -450,6 +446,16 @@ export default function App() {
       const notArchived = !t.archived;
       
       return matchesSearch && matchesStatus && notArchived;
+    });
+
+    // Sort: Flagged tickets first, then newest first
+    return filtered.sort((a, b) => {
+      if (a.isFlagged && !b.isFlagged) return -1;
+      if (!a.isFlagged && b.isFlagged) return 1;
+      
+      const dateA = a.createdAt?.toDate ? a.createdAt.toDate().getTime() : 0;
+      const dateB = b.createdAt?.toDate ? b.createdAt.toDate().getTime() : 0;
+      return dateB - dateA;
     });
   }, [activeTickets, search, statusFilter]);
 
@@ -529,7 +535,7 @@ export default function App() {
       
       const s = t.status;
       if (s === 'Done' || s === 'Complete') counts.done++;
-      else if (s === 'Scheduled') counts.scheduled++;
+      else if (s.includes('scheduled')) counts.scheduled++;
       else if (s === 'Open') counts.open++;
       else if (s === 'Waiting for Parts') counts.w_parts++;
       else if (s === 'Waiting for Invoice') counts.w_invoice++;
@@ -537,13 +543,40 @@ export default function App() {
     return counts;
   }, [currentTickets]);
 
+  const checkIsToday = (dateStr: string | null) => {
+    if (!dateStr) return false;
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    const s = dateStr.trim();
+    if (s.toLowerCase().includes('today')) return true;
+    
+    // Exact match for YYYY-MM-DD
+    if (s === todayStr) return true;
+
+    // Handle MM/DD/YYYY
+    if (s.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
+      const [m, d, y] = s.split('/');
+      return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}` === todayStr;
+    }
+
+    try {
+      const d = new Date(s);
+      if (isNaN(d.getTime())) return false;
+      const vy = d.getFullYear();
+      const vm = d.getMonth() + 1;
+      const vd = d.getDate();
+      return `${vy}-${String(vm).padStart(2, '0')}-${String(vd).padStart(2, '0')}` === todayStr;
+    } catch {
+      return false;
+    }
+  };
+
   const upcomingVisits = useMemo(() => {
     const today = startOfDay(new Date());
     return currentTickets
-      .filter(t => t.status === 'Scheduled' && t.visitDate)
+      .filter(t => t.status.toLowerCase().includes('scheduled') && t.visitDate)
       .filter(t => {
         const d = new Date(t.visitDate!);
-        return !isNaN(d.getTime()) && (isSameDay(d, today) || d > today);
+        return !isNaN(d.getTime()) && (checkIsToday(t.visitDate) || d > today);
       })
       .sort((a, b) => new Date(a.visitDate!).getTime() - new Date(b.visitDate!).getTime());
   }, [currentTickets]);
@@ -715,14 +748,14 @@ export default function App() {
     });
   };
 
-  const [importQuery, setImportQuery] = useState('from:jseefenkhalil@iltexas.org OR Ticket#');
+  const [importQuery, setImportQuery] = useState('Service Ticket OR "Ticket#" OR from:jseefenkhalil@iltexas.org');
 
   const fetchEmailsForImport = async (queryOverride?: string, isSilent = false) => {
     if (isFetchingEmails) return;
     
     if (!isSilent) {
       setIsFetchingEmails(true);
-      setImportStatus('Verifying Gmail connection...');
+      setImportStatus('Searching Gmail...');
       setIsImportModalOpen(true);
       setImportMode('gmail');
       setSelectableEmails([]);
@@ -732,23 +765,23 @@ export default function App() {
     try {
       const accessToken = await getGmailToken();
       if (!accessToken) {
-        if (!isSilent) setImportStatus('Gmail authorization required. Please try again.');
+        if (!isSilent) setImportStatus('Gmail authorization required.');
         setIsFetchingEmails(false);
         return;
       }
 
-      // Check master source of truth (Sheets) to skip completed tickets
+      // Check master source of truth (Sheets) to skip existing tickets
       const sheetTickets = await fetchAllTicketsFromSheets();
-      const completedSheetNums = new Set(
+      const existingSheetNums = new Set(
         sheetTickets
-          .filter(t => t.status.toLowerCase() === 'done' || t.status.toLowerCase() === 'complete')
-          .map(t => t.ticketNumber.replace(/\D/g, ''))
+          .map(t => (t.ticketNumber || '').replace(/\D/g, ''))
+          .filter(num => num.length > 0)
       );
       
       const today = new Date();
-      // Searching from start of yesterday UTC to be safe with timezones
+      // Searching from 7 days ago to be sure we don't miss anything
       const searchDate = new Date(today);
-      searchDate.setDate(today.getDate() - 1);
+      searchDate.setDate(today.getDate() - 7);
       const afterDate = format(searchDate, 'yyyy/MM/dd');
       
       const query = (typeof queryOverride === 'string') ? queryOverride : importQuery;
@@ -819,21 +852,20 @@ export default function App() {
           bodyToSearch += ' ' + findTextParts(detailData.payload.parts);
         }
 
-        const ticketMatch = bodyToSearch.match(/Ticket#\s*(\d+)/i) || bodyToSearch.match(/Ticket\s*#\s*:?\s*(\d+)/i);
+        const ticketMatch = bodyToSearch.match(/(?:Service\s+)?Ticket\s*#?\s*:?\s*(\d+)/i);
         const ticketNum = ticketMatch ? ticketMatch[1] : null;
 
-        // SKIP if ticket already exists and is completed (checked against both Firestore AND Sheets master)
+        // SKIP if ticket already exists (checked against both Firestore AND Sheets master)
         if (ticketNum) {
           const normNum = ticketNum.replace(/\D/g, '');
-          const isCompletedInFirestore = tickets.some(t => {
+          const existsInFirestore = tickets.some(t => {
             const tNum = (t.ticketNumber || '').replace(/\D/g, '');
-            const statusLower = (t.status || '').toLowerCase();
-            return tNum === normNum && (statusLower === 'done' || statusLower === 'complete');
+            return tNum === normNum && tNum.length > 0;
           });
-          const isCompletedInSheets = completedSheetNums.has(normNum);
+          const existsInSheets = existingSheetNums.has(normNum);
           
-          if (isCompletedInFirestore || isCompletedInSheets) {
-            console.log(`Filtering out completed ticket #${ticketNum} from import list`);
+          if (existsInFirestore || (normNum && existsInSheets)) {
+            console.log(`Filtering out existing ticket #${ticketNum} from import list`);
             continue;
           }
         }
@@ -887,18 +919,19 @@ export default function App() {
     setImportStatus('Parsing content...');
 
     try {
-      const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent } = parseEmailHTML(manualContent, '');
+      const { ticketNumber: parsedNumber, subject, status, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent, createdAt: extractedCreatedAt } = parseEmailHTML(manualContent, '');
       
       const ticketNumber = (manualTicketNumber.trim() || parsedNumber).trim();
 
-      if (ticketNumber && (subject || manualContent.length > 50)) {
-        const ticketSub = subject || "Manual Import - " + ticketNumber;
-        const normalizedInput = ticketNumber.replace(/\D/g, '');
+      if (ticketNumber && (subject || manualContent.length > 30)) {
+        const ticketSub = subject || (ticketNumber ? `Support Ticket ${ticketNumber}` : "Manual Import");
+        const normalizedInput = (ticketNumber || '').replace(/\D/g, '');
         const existing = tickets.find(t => {
           const tNum = (t.ticketNumber || '').replace(/\D/g, '');
           return tNum === normalizedInput && tNum.length > 0;
         });
         const finalStatus = getStatusFromSubject(ticketSub, status, content || brief);
+        const autoIsFlagged = checkIfUrgent(ticketSub, content || brief || '');
         
         if (!existing) {
           if (!adminLevel) {
@@ -910,6 +943,7 @@ export default function App() {
             ticketNumber,
             subject: ticketSub,
             status: finalStatus,
+            isFlagged: autoIsFlagged,
             brief: brief || '',
             content: content || '',
             htmlContent: htmlContent || '',
@@ -917,7 +951,7 @@ export default function App() {
             contactName: cName || '',
             address: addr || '',
             userId: adminLevel || 'SYSTEM',
-            createdAt: serverTimestamp(),
+            createdAt: extractedCreatedAt || serverTimestamp(),
             updatedAt: serverTimestamp(),
             priority: 'Medium',
             notes: `Manually imported at ${new Date().toLocaleString()}`,
@@ -928,6 +962,7 @@ export default function App() {
               ticketNumber, 
               subject: ticketSub, 
               status: finalStatus, 
+              isFlagged: autoIsFlagged,
               brief: brief || '', 
               content: content || '', 
               htmlContent: htmlContent || '', 
@@ -935,7 +970,7 @@ export default function App() {
               contactName: cName || '', 
               address: addr || '', 
               userId: adminLevel || 'SYSTEM',
-              createdAt: Timestamp.now(),
+              createdAt: extractedCreatedAt || Timestamp.now(),
               updatedAt: Timestamp.now()
             } as Ticket;
             await syncTicketToSheets(newTicket);
@@ -1026,22 +1061,24 @@ export default function App() {
         return results;
       };
 
+      const getBody = (parts: any[]): string => {
+        for (const p of parts) {
+          if (p.mimeType === 'text/html' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+          if (p.parts) {
+            const b = getBody(p.parts);
+            if (b) return b;
+          }
+        }
+        for (const p of parts) {
+          if (p.mimeType === 'text/plain' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+        }
+        return '';
+      };
+
+      htmlContent = getBody(detailData.payload.parts || [detailData.payload]) || detailData.snippet || '';
+
       const attachments = findAttachmentParts(detailData.payload.parts || [detailData.payload]);
       
-      if (attachments.length === 0) {
-         const getBody = (parts: any[]): string => {
-           for (const p of parts) {
-             if (p.mimeType === 'text/html' && p.body.data) return atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
-             if (p.parts) {
-               const b = getBody(p.parts);
-               if (b) return b;
-             }
-           }
-           return '';
-         };
-         htmlContent = getBody(detailData.payload.parts || [detailData.payload]) || detailData.snippet || '';
-      }
-
       for (const emlPart of attachments) {
         if (emlPart.body.attachmentId) {
           const attachRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msgId}/attachments/${emlPart.body.attachmentId}`, {
@@ -1070,8 +1107,19 @@ export default function App() {
       }
 
       if (htmlContent || innerSubject) {
-        const { ticketNumber: rawNum, subject: parsedSubject, status: rawStatus, contactName: cName, address: addr, visitDate: vDate, brief, content, htmlContent: extractedHtml } = parseEmailHTML(htmlContent || '', innerSubject);
-        const ticketNumber = (rawNum || '').trim();
+        const parsed = parseEmailHTML(htmlContent || '', innerSubject);
+        let ticketNumber = (parsed.ticketNumber || '').trim();
+        let parsedSubject = (parsed.subject || '').trim();
+
+        // Extra fallback in App.tsx logic if parsing was too strict
+        if (!ticketNumber) {
+          const fallbackMatch = (innerSubject + ' ' + (detailData.snippet || '')).match(/(?:Service\s+)?Ticket\s*#?\s*:?\s*(\d+)/i);
+          if (fallbackMatch) ticketNumber = fallbackMatch[1].trim();
+        }
+
+        if (ticketNumber && !parsedSubject) {
+          parsedSubject = innerSubject.replace(/^(FW|RE|FWD|CC):\s*/i, '').trim();
+        }
         
         if (ticketNumber && parsedSubject) {
           const normalizedNum = ticketNumber.replace(/\D/g, '');
@@ -1082,53 +1130,32 @@ export default function App() {
           
 
           if (existing) {
-            const normalizedStatus = (existing.status || '').toLowerCase();
-            if (normalizedStatus === 'done' || normalizedStatus === 'complete') {
-              console.log(`Skipping completed ticket #${ticketNumber}`);
-              continue;
-            }
+            console.log(`Skipping existing ticket #${ticketNumber} (Status: ${existing.status})`);
+            continue;
           }
           
-          const finalStatus = getStatusFromSubject(parsedSubject, rawStatus, content || brief);
+          const finalStatus = getStatusFromSubject(parsedSubject, parsed.status, parsed.content || parsed.brief);
+          const autoIsFlagged = checkIfUrgent(parsedSubject, parsed.content || parsed.brief || '');
           
-          if (!existing) {
-            const data: any = {
-              ticketNumber,
-              subject: parsedSubject,
-              status: finalStatus,
-              brief: brief || '',
-              content: content || '',
-              htmlContent: extractedHtml || '',
-              visitDate: vDate || null,
-              contactName: cName || '',
-              address: addr || '',
-              userId: adminLevel || 'SYSTEM',
-              processedMessageIds: [msgId],
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp()
-            };
-            const docRef = await addDoc(collection(db, 'tickets'), data);
-            await syncTicketToSheets({ ...data, id: docRef.id, createdAt: Timestamp.now(), updatedAt: Timestamp.now() } as Ticket);
-            importedCount++;
-          } else {
-            // Update existing ticket instead of creating new
-            const updateData = {
-              status: finalStatus,
-              brief: brief || existing.brief || "",
-              content:
-                (existing.content ? existing.content + "\n\n" : "") +
-                (content || ""),
-              htmlContent: extractedHtml || existing.htmlContent || "",
-              visitDate: vDate || existing.visitDate,
-              processedMessageIds: arrayUnion(msgId),
-              updatedAt: serverTimestamp(),
-              archived: false,
-              deletedAt: null,
-            };
-            await updateDoc(doc(db, "tickets", existing.id), updateData);
-            await syncTicketToSheets({ ...existing, ...updateData, updatedAt: Timestamp.now() } as Ticket);
-            importedCount++;
-          }
+          const data: any = {
+            ticketNumber,
+            subject: parsedSubject,
+            status: finalStatus,
+            isFlagged: autoIsFlagged,
+            brief: parsed.brief || '',
+            content: parsed.content || '',
+            htmlContent: parsed.htmlContent || '',
+            visitDate: parsed.visitDate || null,
+            contactName: parsed.contactName || '',
+            address: parsed.address || '',
+            userId: adminLevel || 'SYSTEM',
+            processedMessageIds: [msgId],
+            createdAt: parsed.createdAt || serverTimestamp(),
+            updatedAt: serverTimestamp()
+          };
+          const docRef = await addDoc(collection(db, 'tickets'), data);
+          await syncTicketToSheets({ ...data, id: docRef.id, createdAt: parsed.createdAt || Timestamp.now(), updatedAt: Timestamp.now() } as Ticket);
+          importedCount++;
         }
       }
     }
@@ -1423,16 +1450,23 @@ export default function App() {
                       </button>
                     </div>
                     {importStatus && (
-                      <div className="p-2 bg-dash-bg border border-dash-border rounded-lg">
+                      <div className="p-3 bg-dash-bg border border-dash-border rounded-lg flex flex-col gap-2">
                         <p className={cn(
                           "text-[9px] font-bold uppercase tracking-tighter",
-                          importStatus.toLowerCase().includes('unavailable') ? "text-red-500" : "text-dash-accent"
+                          importStatus.toLowerCase().includes('unavailable') || importStatus.toLowerCase().includes('origin') ? "text-red-500" : "text-dash-accent"
                         )}>
                           {importStatus}
                         </p>
+                        {(importStatus.toLowerCase().includes('origin') || importStatus.toLowerCase().includes('authorized')) && (
+                          <div className="p-2 bg-black/20 rounded border border-red-500/20">
+                            <p className="text-[8px] text-red-500 font-bold mb-1">GOOGLE OAUTH MISMATCH DETECTED:</p>
+                            <p className="text-[8px] text-dash-muted mb-2">You must add this specific URL to your "Authorized JavaScript origins" in the Google Cloud Console:</p>
+                            <code className="text-[10px] text-white bg-black/40 p-1 rounded block select-all break-all">{window.location.origin}</code>
+                          </div>
+                        )}
                         {importStatus.toLowerCase().includes('unavailable') && (
-                          <p className="mt-1 text-[8px] text-dash-muted font-medium">
-                            Browsers sometimes block popups in iframes. Try clicking the "Open in New Tab" icon at the top right of this screen.
+                          <p className="text-[8px] text-dash-muted font-medium">
+                            Browsers sometimes block popups in iframes. Try clicking the "Open in New Tab" icon at the top right of this screen, or whitelisting popups.
                           </p>
                         )}
                       </div>
@@ -1790,10 +1824,10 @@ export default function App() {
                       <div className="text-2xl font-bold text-red-600">{stats.open.toString().padStart(2, '0')}</div>
                     </button>
                     <button 
-                      onClick={() => setStatusFilter('Scheduled')}
+                      onClick={() => setStatusFilter('Visit Scheduled')}
                       className={cn(
                         "bg-dash-card p-4 border rounded-xl shadow-sm transition-all text-left group min-h-[90px]",
-                        statusFilter === 'Scheduled' ? "border-blue-500 ring-2 ring-blue-500/20 bg-blue-500/10" : "border-dash-border hover:border-blue-400"
+                        statusFilter === 'Visit Scheduled' ? "border-blue-500 ring-2 ring-blue-500/20 bg-blue-500/10" : "border-dash-border hover:border-blue-400"
                       )}
                     >
                       <div className="text-[9px] font-bold uppercase tracking-widest mb-1 text-blue-600">🗓 Scheduled</div>
@@ -1915,7 +1949,7 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-3">
                       <div className="flex items-center gap-2 bg-dash-card border border-dash-border p-1 rounded-xl overflow-x-auto max-w-full">
-                        {['All', 'Open', 'Scheduled', 'Waiting for Invoice', 'Waiting for Parts', 'Done'].map(status => (
+                        {['All', 'Open', 'Visit Scheduled', 'Waiting for Invoice', 'Waiting for Parts', 'Done'].map(status => (
                           <button
                             key={status}
                             onClick={() => setStatusFilter(status as any)}
@@ -1990,7 +2024,7 @@ export default function App() {
                                 onClick={() => openEdit(t)}
                                 className={cn(
                                   "hover:bg-dash-accent/5 transition-all cursor-pointer group",
-                                  t.status.toLowerCase().includes('visit') && isSameDay(new Date(t.visitDate!), new Date()) && "bg-dash-accent/10 border-l-4 border-l-dash-accent"
+                                  t.status.toLowerCase().includes('visit') && checkIsToday(t.visitDate) && "bg-dash-accent/10 border-l-4 border-l-dash-accent"
                                 )}
                               >
                                 <td className="px-6 py-6 font-mono font-bold text-dash-muted group-hover:text-dash-text relative">
@@ -2015,12 +2049,12 @@ export default function App() {
                                        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-dash-bg border border-dash-border/50 text-[10px] font-bold text-dash-muted">
                                           <Calendar size={10} className="text-dash-muted opacity-60" />
                                           <span className="opacity-50">OPENED:</span>
-                                          {t.createdAt ? (t.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}
+                                          {t.createdAt ? format((t.createdAt as any).toDate(), 'MMM dd, yyyy') : 'N/A'}
                                        </div>
-                                       {t.visitDate && (
+                                       {t.status.toLowerCase().includes('scheduled') && t.visitDate && (
                                          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-dash-accent/5 border border-dash-accent/20 text-[10px] font-black text-dash-accent uppercase italic">
                                             <Clock size={10} className="text-dash-accent" />
-                                            <span>Scheduled: {t.visitDate}</span>
+                                            <span>SCHEDULED: {t.visitDate}</span>
                                          </div>
                                        )}
                                        {t.contactName && <span className="text-[10px] text-dash-muted font-bold uppercase truncate max-w-[150px]">{t.contactName}</span>}
@@ -2143,7 +2177,7 @@ export default function App() {
                     return dateB.getTime() - dateA.getTime();
                   }).map(([monthYear, monthTickets]: [string, Ticket[]]) => {
                     const monthCompleted = monthTickets.filter(t => t.status === 'Done' || t.status === 'Complete');
-                    const monthScheduled = monthTickets.filter(t => t.status === 'Scheduled');
+                    const monthScheduled = monthTickets.filter(t => t.status.toLowerCase().includes('scheduled'));
                     const monthWaiting = monthTickets.filter(t => t.status.toLowerCase().includes('waiting'));
                     
                     return (
@@ -2364,7 +2398,7 @@ export default function App() {
                    <div className="grid grid-cols-2 gap-2">
                       {[
                         { id: 'Open', label: 'Open', icon: '🔴', color: 'border-red-500 text-red-600 bg-red-50' },
-                        { id: 'Scheduled', label: 'Scheduled', icon: '🗓', color: 'border-blue-500 text-blue-600 bg-blue-50' },
+                        { id: 'Visit Scheduled', label: 'Visit Scheduled', icon: '🗓', color: 'border-blue-500 text-blue-600 bg-blue-50' },
                         { id: 'Waiting for Invoice', label: 'W-Invoice', icon: '🧾', color: 'border-amber-500 text-amber-600 bg-amber-50' },
                         { id: 'Waiting for Parts', label: 'W-Parts', icon: '📦', color: 'border-orange-500 text-orange-600 bg-orange-50' },
                         { id: 'Done', label: 'Complete', icon: '✅', color: 'border-emerald-500 text-emerald-600 bg-emerald-50' }
@@ -2386,7 +2420,7 @@ export default function App() {
                       })}
                    </div>
 
-                   {pendingStatus === 'Scheduled' && (
+                   {pendingStatus === 'Visit Scheduled' && (
                      <motion.div 
                        initial={{ height: 0, opacity: 0 }}
                        animate={{ height: 'auto', opacity: 1 }}
@@ -2421,7 +2455,7 @@ export default function App() {
                            setIsManualSaving(false);
                          }
                        }}
-                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Scheduled' || visitDate === editingTicket?.visitDate) && isFlagged === !!editingTicket?.isFlagged)}
+                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Visit Scheduled' || visitDate === editingTicket?.visitDate) && isFlagged === !!editingTicket?.isFlagged)}
                        className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50 disabled:grayscale"
                       >
                         {isManualSaving ? 'Saving Changes...' : 'Save Manual Override'}
