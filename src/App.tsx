@@ -429,6 +429,7 @@ export default function App() {
   const [contactName, setContactName] = useState('');
   const [address, setAddress] = useState('');
   const [isFlagged, setIsFlagged] = useState(false);
+  const [openedDate, setOpenedDate] = useState('');
 
   const filteredTickets = useMemo(() => {
     const filtered = activeTickets.filter(t => {
@@ -1218,6 +1219,7 @@ export default function App() {
     setContactName(ticket.contactName || '');
     setAddress(ticket.address || '');
     setIsFlagged(!!ticket.isFlagged);
+    setOpenedDate(ticket.createdAt?.toDate ? format(ticket.createdAt.toDate(), 'yyyy-MM-dd') : '');
     setIsAddOpen(true);
     setIsDeleting(false);
     setIsSaving(false);
@@ -1982,6 +1984,7 @@ export default function App() {
                           setVisitDate('');
                           setContactName('');
                           setAddress('');
+                          setOpenedDate(format(new Date(), 'yyyy-MM-dd'));
                           setIsAddOpen(true);
                         }}
                         className="bg-dash-accent text-white h-10 px-4 rounded-xl shadow-lg shadow-dash-accent/20 flex items-center gap-2 hover:brightness-110 transition-all font-bold text-[10px] uppercase tracking-widest"
@@ -2443,19 +2446,33 @@ export default function App() {
                          if (!editingTicket || !pendingStatus) return;
                          setIsManualSaving(true);
                          try {
-                           const updates: any = { status: pendingStatus, manualStatusOverride: true, visitDate: visitDate || null, isFlagged: isFlagged, updatedAt: serverTimestamp() };
+                           const newCreatedAt = openedDate ? Timestamp.fromDate(new Date(openedDate + 'T00:00:00')) : editingTicket.createdAt;
+                           const updates: any = { 
+                             status: pendingStatus, 
+                             manualStatusOverride: true, 
+                             visitDate: visitDate || null, 
+                             isFlagged: isFlagged, 
+                             createdAt: newCreatedAt,
+                             updatedAt: serverTimestamp() 
+                           };
 
                            const fullTicket = { ...editingTicket, ...updates } as Ticket;
-      await updateDoc(doc(db, 'tickets', editingTicket.id), updates)
-        .then(() => syncTicketToSheets(fullTicket));
+                           const syncTicket = { ...fullTicket, createdAt: newCreatedAt || editingTicket.createdAt || Timestamp.now(), updatedAt: Timestamp.now() } as Ticket;
                            
+                           await updateDoc(doc(db, 'tickets', editingTicket.id), updates);
+                           await syncTicketToSheets(syncTicket);
                          } catch (err) {
                            console.error(err);
                          } finally {
                            setIsManualSaving(false);
                          }
                        }}
-                       disabled={isManualSaving || (pendingStatus === editingTicket?.status && (pendingStatus !== 'Visit Scheduled' || visitDate === editingTicket?.visitDate) && isFlagged === !!editingTicket?.isFlagged)}
+                       disabled={isManualSaving || (
+                         pendingStatus === editingTicket?.status && 
+                         visitDate === (editingTicket?.visitDate || '') && 
+                         isFlagged === !!editingTicket?.isFlagged && 
+                         openedDate === (editingTicket?.createdAt?.toDate ? format(editingTicket.createdAt.toDate(), 'yyyy-MM-dd') : '')
+                       )}
                        className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50 disabled:grayscale"
                       >
                         {isManualSaving ? 'Saving Changes...' : 'Save Manual Override'}
@@ -2463,18 +2480,21 @@ export default function App() {
                     </div>
                   </div>
 
-                {editingTicket && (
+                {(editingTicket || !editingId) && (
                   <div className="grid grid-cols-2 gap-4">
-                    <div className="p-4 rounded-xl bg-dash-border/30 border border-dash-border">
-                      <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-1 text-center">Opened Date</label>
-                      <div className="text-sm font-bold text-center">
-                        {editingTicket.createdAt ? (editingTicket.createdAt as any).toDate().toLocaleDateString('en-CA') : 'N/A'}
-                      </div>
+                    <div className="p-4 rounded-xl bg-dash-bg border-2 border-dash-border hover:border-dash-accent transition-all group shadow-inner">
+                      <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2 text-center group-hover:text-dash-accent transition-colors">Opened Date</label>
+                      <input 
+                        type="date"
+                        value={openedDate}
+                        onChange={(e) => setOpenedDate(e.target.value)}
+                        className="w-full bg-transparent text-sm font-bold text-center focus:outline-none cursor-pointer"
+                      />
                     </div>
                     <div className="p-4 rounded-xl bg-dash-accent/10 border border-dash-accent/30 shadow-sm shadow-dash-accent/10">
                       <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-accent mb-1 text-center">Scheduled Date</label>
                       <div className="text-base font-black text-dash-accent text-center italic">
-                        {editingTicket.visitDate || 'PENDING'}
+                        {visitDate || (editingTicket?.visitDate) || 'PENDING'}
                       </div>
                     </div>
                   </div>
@@ -2503,20 +2523,22 @@ export default function App() {
 
                 <div>
                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Record Identifier</label>
-                  <div 
-                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 font-mono text-sm opacity-70"
-                  >
-                    #{ticketNumber}
-                  </div>
+                  <input 
+                    value={ticketNumber}
+                    onChange={(e) => setTicketNumber(e.target.value)}
+                    placeholder="Ticket Number"
+                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 font-mono text-sm focus:outline-none focus:border-dash-accent transition-all"
+                  />
                 </div>
 
                 <div>
                   <label className="block text-[10px] font-bold uppercase tracking-widest text-dash-muted mb-2">Subject Context</label>
-                  <div 
-                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm leading-relaxed min-h-[80px]"
-                  >
-                    {subject}
-                  </div>
+                  <textarea 
+                    value={subject}
+                    onChange={(e) => setSubject(e.target.value)}
+                    placeholder="Ticket Subject"
+                    className="w-full bg-dash-bg border border-dash-border rounded px-4 py-3 text-sm leading-relaxed min-h-[80px] focus:outline-none focus:border-dash-accent transition-all"
+                  />
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2541,6 +2563,39 @@ export default function App() {
                 </div>
 
                 <div className="pt-10 space-y-4">
+                  {!editingTicket && canAccessAdmin && (
+                    <button 
+                      type="button"
+                      disabled={isSaving || !ticketNumber || !subject}
+                      onClick={async () => {
+                        setIsSaving(true);
+                        try {
+                          const newCreatedAt = openedDate ? Timestamp.fromDate(new Date(openedDate + 'T00:00:00')) : Timestamp.now();
+                          const data = {
+                            ticketNumber,
+                            subject,
+                            status: pendingStatus || 'Open',
+                            visitDate: visitDate || null,
+                            address: address || null,
+                            createdAt: newCreatedAt,
+                            updatedAt: serverTimestamp(),
+                            isFlagged: isFlagged,
+                            userId: adminLevel || 'SYSTEM'
+                          };
+                          const docRef = await addDoc(collection(db, 'tickets'), data);
+                          await syncTicketToSheets({ ...data, id: docRef.id, createdAt: newCreatedAt, updatedAt: Timestamp.now() } as Ticket);
+                          setIsAddOpen(false);
+                        } catch (err: any) {
+                          console.error("Create failed:", err);
+                        } finally {
+                          setIsSaving(false);
+                        }
+                      }}
+                      className="w-full bg-dash-accent text-white py-4 rounded-xl font-bold text-[10px] uppercase tracking-widest hover:brightness-110 shadow-lg shadow-dash-accent/20 transition-all disabled:opacity-50"
+                    >
+                      {isSaving ? 'Creating Record...' : 'Create New Ticket Record'}
+                    </button>
+                  )}
                   {editingTicket && canAccessAdmin && (
                     <button 
                       type="button"
@@ -2548,15 +2603,22 @@ export default function App() {
                       onClick={async () => {
                         setIsSaving(true);
                         try {
+                          const newCreatedAt = openedDate ? Timestamp.fromDate(new Date(openedDate + 'T00:00:00')) : editingTicket.createdAt;
                           const data = {
                             ticketNumber,
                             subject,
                             visitDate: visitDate || null,
                             address: address || null,
+                            createdAt: newCreatedAt,
                             updatedAt: serverTimestamp()
                           };
                           await updateDoc(doc(db, 'tickets', editingTicket.id), data);
-                          await syncTicketToSheets({ ...editingTicket, ...data, updatedAt: Timestamp.now() } as Ticket);
+                          await syncTicketToSheets({ 
+                            ...editingTicket, 
+                            ...data, 
+                            createdAt: newCreatedAt || editingTicket.createdAt || Timestamp.now(),
+                            updatedAt: Timestamp.now() 
+                          } as Ticket);
                           setIsAddOpen(false);
                         } catch (err: any) {
                           console.error("Update failed:", err);
