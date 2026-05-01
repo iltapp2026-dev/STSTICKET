@@ -142,11 +142,17 @@ export function extractVisitDate(content: string, referenceDate?: Date): string 
   if (lowerContent.includes('tomorrow') && (visitKeywords.some(kw => lowerContent.includes(kw)) || lowerContent.includes('visit'))) {
     const tomorrow = new Date(ref);
     tomorrow.setDate(ref.getDate() + 1);
-    return tomorrow.toISOString().split('T')[0];
+    const y = tomorrow.getFullYear();
+    const m = tomorrow.getMonth() + 1;
+    const d = tomorrow.getDate();
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
   }
   
   if (lowerContent.includes('today') && (visitKeywords.some(kw => lowerContent.includes(kw)) || lowerContent.includes('visit'))) {
-    return ref.toISOString().split('T')[0];
+    const y = ref.getFullYear();
+    const m = ref.getMonth() + 1;
+    const d = ref.getDate();
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
   }
 
   const hasVisitKeyword = visitKeywords.some(kw => lowerContent.includes(kw));
@@ -194,9 +200,9 @@ export function parseEmailHTML(html: string, emailSubject?: string): {
   let subject = '';
 
   if (emailSubject) {
-    // Improved detection for Service Ticket #92000
-    const ticketMatch = emailSubject.match(/(?:Service\s+)?Ticket\s*#?\s*(\d+)/i) || 
-                         bodyText.match(/(?:Service\s+)?Ticket\s*#?\s*(\d+)/i);
+    // Improved detection for Service Ticket #92000, #92000, Ticket 92000
+    const ticketMatch = emailSubject.match(/(?:(?:Service\s+)?Ticket\s*(?:#|:)?|#)\s*(\d+)/i) || 
+                         bodyText.match(/(?:(?:Service\s+)?Ticket\s*(?:#|:)?|#)\s*(\d+)/i);
     if (ticketMatch) ticketNumber = ticketMatch[1].trim();
 
     const subjectMatch = emailSubject.match(/(?:IL\s?Texas\s*-\s*)(.*?)\s*--/i) || 

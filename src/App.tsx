@@ -272,10 +272,7 @@ export default function App() {
 
   const todayVisits = useMemo(() => {
     const today = new Date();
-    const todayY = today.getFullYear();
-    const todayM = today.getMonth() + 1;
-    const todayD = today.getDate();
-    const todayStr = `${todayY}-${String(todayM).padStart(2, '0')}-${String(todayD).padStart(2, '0')}`;
+    const todayStr = format(today, 'yyyy-MM-dd');
     
     return tickets.filter(t => {
       if (!t.status.toLowerCase().includes('scheduled') || !t.visitDate) return false;
@@ -283,7 +280,12 @@ export default function App() {
       const vDateStr = String(t.visitDate).trim();
       if (vDateStr.toLowerCase().includes('today')) return true;
 
-      // Robust check for today in local time
+      // Handle ISO date format (YYYY-MM-DD) through direct string match to avoid timezone shifts
+      if (vDateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+        return vDateStr === todayStr;
+      }
+
+      // Robust check for today in local time for other formats
       if (vDateStr === todayStr) return true;
 
       // Handle MM/DD/YYYY
@@ -294,15 +296,12 @@ export default function App() {
       }
 
       try {
-        // Fallback for objects or other string formats
+        // Fallback: Parse safely by treating as local date if it's just a date string
+        // Note: new Date(year, month, day) is always local
         const vDate = new Date(t.visitDate);
         if (isNaN(vDate.getTime())) return false;
         
-        // Use local components to avoid UTC shift
-        const vy = vDate.getFullYear();
-        const vm = vDate.getMonth() + 1;
-        const vd = vDate.getDate();
-        const normalized = `${vy}-${String(vm).padStart(2, '0')}-${String(vd).padStart(2, '0')}`;
+        const normalized = format(vDate, 'yyyy-MM-dd');
         return normalized === todayStr;
       } catch (e) {
         return false;
@@ -363,6 +362,7 @@ export default function App() {
   const [manualContent, setManualContent] = useState('');
   const [manualTicketNumber, setManualTicketNumber] = useState('');
   const [selectableEmails, setSelectableEmails] = useState<any[]>([]);
+  const [skippedCount, setSkippedCount] = useState(0);
   const [selectedEmailIds, setSelectedEmailIds] = useState<Set<string>>(new Set());
   const [isFetchingEmails, setIsFetchingEmails] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
@@ -560,12 +560,12 @@ export default function App() {
     }
 
     try {
+      if (s.match(/^\d{4}-\d{2}-\d{2}$/)) {
+        return s === todayStr;
+      }
       const d = new Date(s);
       if (isNaN(d.getTime())) return false;
-      const vy = d.getFullYear();
-      const vm = d.getMonth() + 1;
-      const vd = d.getDate();
-      return `${vy}-${String(vm).padStart(2, '0')}-${String(vd).padStart(2, '0')}` === todayStr;
+      return format(d, 'yyyy-MM-dd') === todayStr;
     } catch {
       return false;
     }
@@ -573,11 +573,20 @@ export default function App() {
 
   const upcomingVisits = useMemo(() => {
     const today = startOfDay(new Date());
+    const todayStr = format(today, 'yyyy-MM-dd');
     return currentTickets
       .filter(t => t.status.toLowerCase().includes('scheduled') && t.visitDate)
       .filter(t => {
-        const d = new Date(t.visitDate!);
-        return !isNaN(d.getTime()) && (checkIsToday(t.visitDate) || d > today);
+        const vDateStr = String(t.visitDate).trim();
+        if (checkIsToday(vDateStr)) return true;
+        
+        // If it looks like ISO (YYYY-MM-DD), use string compare
+        if (vDateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
+           return vDateStr > todayStr;
+        }
+
+        const d = new Date(vDateStr);
+        return !isNaN(d.getTime()) && d > today;
       })
       .sort((a, b) => new Date(a.visitDate!).getTime() - new Date(b.visitDate!).getTime());
   }, [currentTickets]);
@@ -749,7 +758,7 @@ export default function App() {
     });
   };
 
-  const [importQuery, setImportQuery] = useState('Service Ticket OR "Ticket#" OR from:jseefenkhalil@iltexas.org');
+  const [importQuery, setImportQuery] = useState('Service OR Ticket OR "Ticket#" OR from:jseefenkhalil@iltexas.org');
 
   const fetchEmailsForImport = async (queryOverride?: string, isSilent = false) => {
     if (isFetchingEmails) return;
@@ -760,6 +769,7 @@ export default function App() {
       setIsImportModalOpen(true);
       setImportMode('gmail');
       setSelectableEmails([]);
+      setSkippedCount(0);
       setSelectedEmailIds(new Set());
     }
     
@@ -780,13 +790,13 @@ export default function App() {
       );
       
       const today = new Date();
-      // Searching from 7 days ago to be sure we don't miss anything
+      // Searching from 60 days ago to be sure we don't miss anything
       const searchDate = new Date(today);
-      searchDate.setDate(today.getDate() - 7);
+      searchDate.setDate(today.getDate() - 60);
       const afterDate = format(searchDate, 'yyyy/MM/dd');
       
       const query = (typeof queryOverride === 'string') ? queryOverride : importQuery;
-      // Search for messages since yesterday UTC
+      // Search for messages
       const finalQuery = `${query} after:${afterDate}`;
       
       if (!isSilent) setImportStatus(`Searching Gmail since ${afterDate}...`);
@@ -813,6 +823,7 @@ export default function App() {
       }
 
       const emailDetails: { id: string, subject: string, snippet: string, date: Date, ticketNumber: string | null }[] = [];
+      let skipped = 0;
       
       for (const msg of searchData.messages) {
         // We no longer skip processed messages - user wants to be able to "import anytime"
@@ -835,7 +846,7 @@ export default function App() {
         const date = headers.find((h: any) => h.name.toLowerCase() === 'date')?.value || '';
 
         // Extract more content to find ticket number if not in snippet
-        let bodyToSearch = (detailData.snippet || '') + ' ' + subject;
+        let bodyToSearch = subject + ' ' + (detailData.snippet || '');
         if (detailData.payload?.parts) {
           const findTextParts = (parts: any[]): string => {
             let text = '';
@@ -844,6 +855,12 @@ export default function App() {
                 try {
                   text += atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
                 } catch(e) {}
+              } else if (p.mimeType === 'text/html' && p.body?.data) {
+                 // Also check HTML parts if plain text is empty
+                 try {
+                   const html = atob(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+                   text += html.replace(/<[^>]*>?/gm, ' '); // Strip HTML tags for regex matching
+                 } catch(e) {}
               } else if (p.parts) {
                 text += findTextParts(p.parts);
               }
@@ -853,20 +870,24 @@ export default function App() {
           bodyToSearch += ' ' + findTextParts(detailData.payload.parts);
         }
 
-        const ticketMatch = bodyToSearch.match(/(?:Service\s+)?Ticket\s*#?\s*:?\s*(\d+)/i);
+        // Improved regex to handle "Ticket #12345", "Ticket: 12345", "#12345", etc.
+        const ticketMatch = bodyToSearch.match(/(?:(?:Service\s+)?Ticket\s*(?:#|:)?|#)\s*(\d+)/i);
         const ticketNum = ticketMatch ? ticketMatch[1] : null;
 
         // SKIP if ticket already exists (checked against both Firestore AND Sheets master)
+        // We only skip if the ticket is NOT deleted
         if (ticketNum) {
           const normNum = ticketNum.replace(/\D/g, '');
           const existsInFirestore = tickets.some(t => {
             const tNum = (t.ticketNumber || '').replace(/\D/g, '');
-            return tNum === normNum && tNum.length > 0;
+            const isDeleted = !!t.deletedAt;
+            return tNum === normNum && tNum.length > 0 && !isDeleted;
           });
           const existsInSheets = existingSheetNums.has(normNum);
           
           if (existsInFirestore || (normNum && existsInSheets)) {
             console.log(`Filtering out existing ticket #${ticketNum} from import list`);
+            skipped++;
             continue;
           }
         }
@@ -880,8 +901,10 @@ export default function App() {
         });
       }
 
+      setSkippedCount(skipped);
+
       if (emailDetails.length === 0) {
-        if (!isSilent) setImportStatus("No matching emails found to process.");
+        if (!isSilent) setImportStatus(skipped > 0 ? `${skipped} existing tickets were hidden. No new tickets found.` : "No matching emails found to process.");
       } else {
         setSelectableEmails(emailDetails.sort((a, b) => b.date.getTime() - a.date.getTime()));
         
@@ -1130,7 +1153,7 @@ export default function App() {
           });
           
 
-          if (existing) {
+          if (existing && !existing.deletedAt) {
             console.log(`Skipping existing ticket #${ticketNumber} (Status: ${existing.status})`);
             continue;
           }
@@ -1414,11 +1437,16 @@ export default function App() {
                   </button>
                 </div>
 
-                {importMode === 'gmail' && selectableEmails.length > 0 && (
+                {importMode === 'gmail' && (selectableEmails.length > 0 || skippedCount > 0) && (
                   <div className="flex items-center justify-between px-1">
                     <span className="text-[10px] text-dash-muted font-bold uppercase tracking-widest">
                       {selectableEmails.length} New Tickets Detected
                     </span>
+                    {skippedCount > 0 && (
+                      <span className="text-[10px] text-amber-500 font-bold uppercase tracking-widest">
+                        {skippedCount} Existing Hidden
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -1489,8 +1517,13 @@ export default function App() {
                       <div className="py-20 text-center">
                         <Mail className="w-12 h-12 text-dash-border mx-auto mb-4" />
                         <p className="text-sm text-dash-muted italic">No recent un-imported tickets found.</p>
+                        {skippedCount > 0 && (
+                          <p className="text-[10px] text-amber-500 font-bold uppercase tracking-widest mt-2">
+                             Found {skippedCount} emails, but they all match tickets already in the database.
+                          </p>
+                        )}
                         <p className="text-[10px] text-dash-muted uppercase font-bold tracking-widest mt-4 mb-6">
-                           Scanning Splendid ticket notifications from the last 3 days.
+                           Scanning Splendid ticket notifications from the last 30 days.
                         </p>
                         <button 
                           onClick={() => fetchEmailsForImport()}
