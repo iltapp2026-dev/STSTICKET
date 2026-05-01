@@ -270,9 +270,21 @@ export default function App() {
     if (adminLevel) reconcileWithSheets();
   }, [adminLevel]);
 
+  const getCentralTodayStr = () => {
+    try {
+      return new Intl.DateTimeFormat('en-CA', { 
+        timeZone: 'America/Chicago', 
+        year: 'numeric', 
+        month: '2-digit', 
+        day: '2-digit' 
+      }).format(new Date());
+    } catch (e) {
+      return format(new Date(), 'yyyy-MM-dd');
+    }
+  };
+
   const todayVisits = useMemo(() => {
-    const today = new Date();
-    const todayStr = format(today, 'yyyy-MM-dd');
+    const todayStr = getCentralTodayStr();
     
     return tickets.filter(t => {
       if (!t.status.toLowerCase().includes('scheduled') || !t.visitDate) return false;
@@ -280,7 +292,7 @@ export default function App() {
       const vDateStr = String(t.visitDate).trim();
       if (vDateStr.toLowerCase().includes('today')) return true;
 
-      // Handle ISO date format (YYYY-MM-DD) through direct string match to avoid timezone shifts
+      // Handle ISO date format (YYYY-MM-DD)
       if (vDateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
         return vDateStr === todayStr;
       }
@@ -534,19 +546,19 @@ export default function App() {
       
       if (t.isFlagged) counts.flagged++;
       
-      const s = t.status;
-      if (s === 'Done' || s === 'Complete') counts.done++;
-      else if (s.includes('scheduled')) counts.scheduled++;
-      else if (s === 'Open') counts.open++;
-      else if (s === 'Waiting for Parts') counts.w_parts++;
-      else if (s === 'Waiting for Invoice') counts.w_invoice++;
+      const s = t.status.toLowerCase();
+      if (s === 'done' || s === 'complete' || s === 'resolved') counts.done++;
+      else if (s.includes('scheduled') || s.includes('visit')) counts.scheduled++;
+      else if (s === 'open') counts.open++;
+      else if (s.includes('parts')) counts.w_parts++;
+      else if (s.includes('invoice')) counts.w_invoice++;
     });
     return counts;
   }, [currentTickets]);
 
   const checkIsToday = (dateStr: string | null) => {
     if (!dateStr) return false;
-    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    const todayStr = getCentralTodayStr();
     const s = dateStr.trim();
     if (s.toLowerCase().includes('today')) return true;
     
@@ -572,8 +584,10 @@ export default function App() {
   };
 
   const upcomingVisits = useMemo(() => {
-    const today = startOfDay(new Date());
-    const todayStr = format(today, 'yyyy-MM-dd');
+    const todayStr = getCentralTodayStr();
+    // For date object comparisons, we still need a local date but anchored to start of day
+    const today = startOfDay(new Date()); 
+    
     return currentTickets
       .filter(t => t.status.toLowerCase().includes('scheduled') && t.visitDate)
       .filter(t => {
@@ -883,10 +897,9 @@ export default function App() {
             const isDeleted = !!t.deletedAt;
             return tNum === normNum && tNum.length > 0 && !isDeleted;
           });
-          const existsInSheets = existingSheetNums.has(normNum);
           
-          if (existsInFirestore || (normNum && existsInSheets)) {
-            console.log(`Filtering out existing ticket #${ticketNum} from import list`);
+          if (existsInFirestore) {
+            console.log(`Filtering out active ticket #${ticketNum} from import list`);
             skipped++;
             continue;
           }

@@ -164,7 +164,10 @@ export function extractVisitDate(content: string, referenceDate?: Date): string 
       try {
         const d = new Date(dateStr);
         if (!isNaN(d.getTime())) {
-          return d.toISOString().split('T')[0];
+          const y = d.getFullYear();
+          const month = d.getMonth() + 1;
+          const dayCount = d.getDate();
+          return `${y}-${String(month).padStart(2, '0')}-${String(dayCount).padStart(2, '0')}`;
         }
       } catch (e) {}
       return dateStr;
